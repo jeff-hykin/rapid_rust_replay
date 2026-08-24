@@ -1,0 +1,29 @@
+[package]
+name = "rapid_rust_replay"
+version = "0.1.0"
+edition = "2021"
+description = "Replay DimOS recordings onto LCM or Zenoh"
+license = "Apache-2.0"
+
+[[bin]]
+name = "rrr"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+byteorder = "1"
+clap = { version = "4", features = ["derive"] }
+dimos-lcm = { git = "https://github.com/dimensionalOS/dimos-lcm.git", branch = "rust-codegen" }
+lcm-msgs = { git = "https://github.com/dimensionalOS/dimos-lcm.git", branch = "rust-codegen" }
+lz4_flex = "0.11"
+mcap = "0.9"
+memmap2 = "0.9"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+zenoh = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

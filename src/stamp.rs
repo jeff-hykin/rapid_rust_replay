@@ -1,0 +1,326 @@
+//! Rewriting `header.stamp` inside LCM wire payloads.
+//!
+//! LCM lays fields out in declaration order, big-endian, with no padding, after
+//! an 8-byte fingerprint. Array-length fields are declared before the header in
+//! the dimos `.lcm` definitions, so for every stamped type the stamp sits at a
+//! constant offset: `8 + 4*leading_length_fields + 4 (header.seq)`. That lets us
+//! patch 8 bytes in place instead of decoding and re-encoding a multi-megabyte
+//! point cloud. `tests::offsets_match_encoder` pins every entry against the
+//! real encoder in `lcm-msgs`.
+
+use anyhow::{Context, Result};
+use lcm_msgs::tf2_msgs::TFMessage;
+
+/// How a message type's timestamp can be rewritten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Support {
+    /// `stamp.sec` lives at this byte offset, `stamp.nsec` at `offset + 4`.
+    Fixed(usize),
+    /// Variable-length array of independently stamped transforms.
+    TfMessage,
+    /// No known timestamp field; payload is republished untouched.
+    None,
+}
+
+pub fn support_for(msg_name: &str) -> Support {
+    match msg_name {
+        "tf2_msgs.TFMessage" | "geometry_msgs.Transform" => Support::TfMessage,
+
+        "geometry_msgs.PointStamped"
+        | "geometry_msgs.PoseStamped"
+        | "geometry_msgs.PoseWithCovarianceStamped"
+        | "geometry_msgs.TransformStamped"
+        | "geometry_msgs.TwistStamped"
+        | "geometry_msgs.TwistWithCovarianceStamped"
+        | "geometry_msgs.WrenchStamped"
+        | "nav_msgs.Odometry"
+        | "sensor_msgs.Imu" => Support::Fixed(12),
+
+        // Bare `builtin_interfaces.Time`, so no `seq` ahead of it.
+        "foxglove_msgs.CompressedVideo" => Support::Fixed(12),
+
+        "nav_msgs.LineSegments3D"
+        | "nav_msgs.OccupancyGrid"
+        | "nav_msgs.Path"
+        | "sensor_msgs.CameraInfo"
+        | "sensor_msgs.CompressedImage"
+        | "sensor_msgs.Image"
+        | "vision_msgs.Detection2D"
+        | "vision_msgs.Detection2DArray"
+        | "vision_msgs.Detection3D"
+        | "vision_msgs.Detection3DArray" => Support::Fixed(16),
+
+        "sensor_msgs.Joy" | "sensor_msgs.PointCloud2" => Support::Fixed(20),
+
+        "sensor_msgs.JointState" => Support::Fixed(28),
+
+        _ => Support::None,
+    }
+}
+
+pub const NANOS_PER_SEC: i64 = 1_000_000_000;
+
+pub fn seconds_to_nanos(seconds: f64) -> i64 {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return 0;
+    }
+    (seconds * NANOS_PER_SEC as f64).round() as i64
+}
+
+/// Maps recording-clock timestamps onto the replay wall clock.
+///
+/// Arithmetic stays in integer nanoseconds. A Unix timestamp in `f64` *seconds*
+/// only resolves to ~100 ns, so round-tripping a stamp through `f64` would
+/// perturb it even when the mapping is a whole-second shift.
+#[derive(Debug, Clone, Copy)]
+pub enum Retimer {
+    /// Stamps track emission: at `--rate 2` they end up twice as close together.
+    Scaled { first_ns: i64, start_wall_ns: i64, rate: f64 },
+    /// Stamps move to the present but keep their original spacing.
+    Shifted { delta_ns: i64 },
+    /// Payloads keep whatever the recording captured.
+    Original,
+}
+
+impl Retimer {
+    pub fn map(&self, ns: i64) -> i64 {
+        match *self {
+            // `ns - first_ns` is elapsed recording time, small enough that f64
+            // represents it exactly; only the division needs floating point.
+            Retimer::Scaled { first_ns, start_wall_ns, rate } => {
+                start_wall_ns + ((ns - first_ns) as f64 / rate).round() as i64
+            }
+            Retimer::Shifted { delta_ns } => ns + delta_ns,
+            Retimer::Original => ns,
+        }
+    }
+
+    /// Rewrites the payload's stamps in place.
+    ///
+    /// `fallback_ns` stands in when the recorded stamp is unset (`sec <= 0`),
+    /// matching how the dimos recorder falls back to reception time.
+    pub fn apply(&self, support: Support, buf: &mut Vec<u8>, fallback_ns: i64) -> Result<()> {
+        if matches!(self, Retimer::Original) {
+            return Ok(());
+        }
+        match support {
+            Support::None => Ok(()),
+            Support::Fixed(offset) => {
+                if buf.len() < offset + 8 {
+                    anyhow::bail!(
+                        "payload is {} bytes, too short to hold a stamp at offset {offset}",
+                        buf.len()
+                    );
+                }
+                let original = read_nanos(buf, offset).unwrap_or(fallback_ns);
+                write_nanos(buf, offset, self.map(original));
+                Ok(())
+            }
+            Support::TfMessage => {
+                let mut message = TFMessage::decode(buf).context("invalid LCM TFMessage")?;
+                for transform in &mut message.transforms {
+                    let stamp = &mut transform.header.stamp;
+                    let original = nanos_from_parts(stamp.sec, stamp.nsec).unwrap_or(fallback_ns);
+                    let (sec, nsec) = nanos_to_parts(self.map(original));
+                    stamp.sec = sec;
+                    stamp.nsec = nsec;
+                }
+                *buf = message.encode();
+                Ok(())
+            }
+        }
+    }
+}
+
+fn read_nanos(buf: &[u8], offset: usize) -> Option<i64> {
+    let sec = i32::from_be_bytes(buf[offset..offset + 4].try_into().ok()?);
+    let nsec = i32::from_be_bytes(buf[offset + 4..offset + 8].try_into().ok()?);
+    nanos_from_parts(sec, nsec)
+}
+
+fn write_nanos(buf: &mut [u8], offset: usize, ns: i64) {
+    let (sec, nsec) = nanos_to_parts(ns);
+    buf[offset..offset + 4].copy_from_slice(&sec.to_be_bytes());
+    buf[offset + 4..offset + 8].copy_from_slice(&nsec.to_be_bytes());
+}
+
+/// `sec <= 0` is dimos's "unset" marker, not a real 1970 timestamp.
+fn nanos_from_parts(sec: i32, nsec: i32) -> Option<i64> {
+    (sec > 0).then(|| i64::from(sec) * NANOS_PER_SEC + i64::from(nsec))
+}
+
+fn nanos_to_parts(ns: i64) -> (i32, i32) {
+    if ns <= 0 {
+        return (0, 0);
+    }
+    let sec = ns.div_euclid(NANOS_PER_SEC);
+    (sec.try_into().unwrap_or(i32::MAX), ns.rem_euclid(NANOS_PER_SEC) as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lcm_msgs::std_msgs::{Header, Time};
+
+    const SEC: i32 = 1_781_260_015;
+    const NSEC: i32 = 113_250_000;
+
+    fn header() -> Header {
+        Header { seq: 7, stamp: Time { sec: SEC, nsec: NSEC }, frame_id: "camera".into() }
+    }
+
+    /// Every `Support::Fixed` offset must agree with what `lcm-msgs` actually encodes.
+    #[test]
+    fn offsets_match_encoder() {
+        macro_rules! check {
+            ($name:literal, $encoded:expr) => {{
+                let bytes = $encoded;
+                let Support::Fixed(offset) = support_for($name) else {
+                    panic!("{} is not registered as a fixed-offset type", $name);
+                };
+                assert_eq!(
+                    read_nanos(&bytes, offset),
+                    nanos_from_parts(SEC, NSEC),
+                    "offset {offset} is wrong for {}",
+                    $name
+                );
+            }};
+        }
+
+        use lcm_msgs::{foxglove_msgs, geometry_msgs, nav_msgs, sensor_msgs, vision_msgs};
+
+        check!("geometry_msgs.PointStamped", geometry_msgs::PointStamped { header: header(), ..Default::default() }.encode());
+        check!("geometry_msgs.PoseStamped", geometry_msgs::PoseStamped { header: header(), ..Default::default() }.encode());
+        check!("geometry_msgs.PoseWithCovarianceStamped", geometry_msgs::PoseWithCovarianceStamped { header: header(), ..Default::default() }.encode());
+        check!("geometry_msgs.TransformStamped", geometry_msgs::TransformStamped { header: header(), ..Default::default() }.encode());
+        check!("geometry_msgs.TwistStamped", geometry_msgs::TwistStamped { header: header(), ..Default::default() }.encode());
+        check!("geometry_msgs.TwistWithCovarianceStamped", geometry_msgs::TwistWithCovarianceStamped { header: header(), ..Default::default() }.encode());
+        check!("geometry_msgs.WrenchStamped", geometry_msgs::WrenchStamped { header: header(), ..Default::default() }.encode());
+        check!("nav_msgs.Odometry", nav_msgs::Odometry { header: header(), ..Default::default() }.encode());
+        check!("sensor_msgs.Imu", sensor_msgs::Imu { header: header(), ..Default::default() }.encode());
+
+        check!("nav_msgs.OccupancyGrid", nav_msgs::OccupancyGrid { header: header(), ..Default::default() }.encode());
+        check!("nav_msgs.Path", nav_msgs::Path { header: header(), ..Default::default() }.encode());
+        check!("sensor_msgs.CameraInfo", sensor_msgs::CameraInfo { header: header(), ..Default::default() }.encode());
+        check!("sensor_msgs.CompressedImage", sensor_msgs::CompressedImage { header: header(), ..Default::default() }.encode());
+        check!("sensor_msgs.Image", sensor_msgs::Image { header: header(), ..Default::default() }.encode());
+        check!("vision_msgs.Detection2D", vision_msgs::Detection2D { header: header(), ..Default::default() }.encode());
+        check!("vision_msgs.Detection2DArray", vision_msgs::Detection2DArray { header: header(), ..Default::default() }.encode());
+        check!("vision_msgs.Detection3D", vision_msgs::Detection3D { header: header(), ..Default::default() }.encode());
+        check!("vision_msgs.Detection3DArray", vision_msgs::Detection3DArray { header: header(), ..Default::default() }.encode());
+
+        check!("sensor_msgs.Joy", sensor_msgs::Joy { header: header(), ..Default::default() }.encode());
+        check!("sensor_msgs.PointCloud2", sensor_msgs::PointCloud2 { header: header(), ..Default::default() }.encode());
+
+        check!("sensor_msgs.JointState", sensor_msgs::JointState { header: header(), ..Default::default() }.encode());
+
+        check!(
+            "foxglove_msgs.CompressedVideo",
+            foxglove_msgs::CompressedVideo {
+                timestamp: lcm_msgs::builtin_interfaces::Time { sec: SEC, nanosec: NSEC },
+                ..Default::default()
+            }
+            .encode()
+        );
+    }
+
+    /// Patching must touch only the stamp — every other byte stays identical.
+    #[test]
+    fn patch_leaves_the_rest_of_the_payload_alone() {
+        let image = lcm_msgs::sensor_msgs::Image {
+            header: header(),
+            height: 480,
+            width: 640,
+            encoding: "jpeg".into(),
+            step: 0,
+            data: (0..2048u32).map(|byte| byte as u8).collect(),
+            ..Default::default()
+        };
+        let original = image.encode();
+        let mut patched = original.clone();
+
+        let retimer = Retimer::Shifted { delta_ns: 1000 * NANOS_PER_SEC };
+        retimer.apply(support_for("sensor_msgs.Image"), &mut patched, 0).unwrap();
+
+        assert_eq!(original.len(), patched.len());
+        let decoded = lcm_msgs::sensor_msgs::Image::decode(&patched).unwrap();
+        assert_eq!(decoded.data, image.data);
+        assert_eq!(decoded.encoding, image.encoding);
+        assert_eq!(decoded.header.frame_id, image.header.frame_id);
+        assert_eq!(decoded.header.stamp.sec, SEC + 1000);
+        assert_eq!(decoded.header.stamp.nsec, NSEC);
+    }
+
+    #[test]
+    fn tf_message_stamps_all_transforms() {
+        let message = TFMessage {
+            transforms: vec![
+                geometry_stamped("odom", "base_link"),
+                geometry_stamped("base_link", "camera"),
+            ],
+        };
+        let mut buf = message.encode();
+
+        let retimer = Retimer::Shifted { delta_ns: 60 * NANOS_PER_SEC };
+        retimer.apply(Support::TfMessage, &mut buf, 0).unwrap();
+
+        let decoded = TFMessage::decode(&buf).unwrap();
+        assert_eq!(decoded.transforms.len(), 2);
+        for transform in &decoded.transforms {
+            assert_eq!(transform.header.stamp.sec, SEC + 60);
+        }
+        assert_eq!(decoded.transforms[1].child_frame_id, "camera");
+    }
+
+    fn geometry_stamped(frame: &str, child: &str) -> lcm_msgs::geometry_msgs::TransformStamped {
+        lcm_msgs::geometry_msgs::TransformStamped {
+            header: Header {
+                seq: 0,
+                stamp: Time { sec: SEC, nsec: NSEC },
+                frame_id: frame.into(),
+            },
+            child_frame_id: child.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unset_stamps_fall_back_to_reception_time() {
+        let mut buf = lcm_msgs::nav_msgs::Odometry::default().encode();
+        let retimer = Retimer::Shifted { delta_ns: 0 };
+        retimer.apply(Support::Fixed(12), &mut buf, seconds_to_nanos(1234.5)).unwrap();
+
+        let decoded = lcm_msgs::nav_msgs::Odometry::decode(&buf).unwrap();
+        assert_eq!(decoded.header.stamp.sec, 1234);
+        assert_eq!(decoded.header.stamp.nsec, 500_000_000);
+    }
+
+    #[test]
+    fn scaled_retimer_compresses_intervals_by_rate() {
+        let retimer = Retimer::Scaled {
+            first_ns: 100 * NANOS_PER_SEC,
+            start_wall_ns: 5000 * NANOS_PER_SEC,
+            rate: 2.0,
+        };
+        assert_eq!(retimer.map(100 * NANOS_PER_SEC), 5000 * NANOS_PER_SEC);
+        assert_eq!(retimer.map(110 * NANOS_PER_SEC), 5005 * NANOS_PER_SEC);
+    }
+
+    /// A whole-second shift must leave the nanosecond field bit-identical;
+    /// going through f64 seconds would perturb it by ~100 ns.
+    #[test]
+    fn shifting_preserves_nanosecond_precision() {
+        let mut buf = lcm_msgs::nav_msgs::Odometry {
+            header: header(),
+            ..Default::default()
+        }
+        .encode();
+        Retimer::Shifted { delta_ns: 1000 * NANOS_PER_SEC }
+            .apply(Support::Fixed(12), &mut buf, 0)
+            .unwrap();
+
+        let decoded = lcm_msgs::nav_msgs::Odometry::decode(&buf).unwrap();
+        assert_eq!(decoded.header.stamp.sec, SEC + 1000);
+        assert_eq!(decoded.header.stamp.nsec, NSEC);
+    }
+}
