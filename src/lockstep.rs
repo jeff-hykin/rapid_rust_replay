@@ -51,6 +51,7 @@ impl Lockstep {
         spec: &str,
         streams: &[Stream],
         sink: &Sink,
+        prefix: &str,
         timeout: Duration,
     ) -> Result<Self> {
         let (gate, reply) = spec
@@ -60,7 +61,9 @@ impl Lockstep {
             .iter()
             .position(|stream| stream.name == gate)
             .with_context(|| format!("--lockstep waits on {gate}, which is not being replayed"))?;
-        let arrivals = sink.watch(reply).await?;
+        // The reply comes from a module in the same graph, so it is namespaced
+        // the same way our own publishes are.
+        let arrivals = sink.watch(&format!("{prefix}{reply}")).await?;
         Ok(Self { stream, timeouts: 0, timeout, arrivals, outstanding: None })
     }
 

@@ -45,8 +45,18 @@ left at 0.
 ## What it writes
 
 The name follows the DimOS conventions: `topic#msg_name` on LCM,
-`topic/msg_name` on Zenoh. A leading `/` on a ROS topic is dropped, since DimOS
-stream names never carry one. `--prefix` is prepended to both.
+`topic/msg_name` on Zenoh.
+
+DimOS also namespaces every topic, and the two transports do it differently: an
+LCM channel is a leading-slash path (`/wheel_odometry#nav_msgs.Odometry`), while
+a Zenoh key expression cannot start with `/` and lives under `dimos`
+(`dimos/wheel_odometry/nav_msgs.Odometry`). `--prefix` therefore defaults to `/`
+on LCM and `dimos/` on Zenoh, which is what a live DimOS graph subscribes to.
+Pass `--prefix ''` for unqualified names.
+
+Getting this wrong is silent in both directions — nothing subscribes, so nothing
+complains, and the replay still reports every message as published. `--list`
+prints the exact wire name, which is the only way to see it before a run.
 
 Zenoh sessions honour `ZENOH_CONFIG`, so endpoints and scouting can be pointed
 somewhere specific without this tool growing a flag per knob:
@@ -121,7 +131,8 @@ reported.
 
 The reply topic is matched as a family, so `fused_odom` also accepts
 `fused_odom#nav_msgs.Odometry` on LCM and `fused_odom/nav_msgs.Odometry` on
-Zenoh. It is taken literally and `--prefix` is not applied to it.
+Zenoh. `--prefix` is applied to it, since the reply comes from a module in the
+same graph and is namespaced the same way our own publishes are.
 
 How fast the replies come back is measured from each publish, so it reflects the
 consumer rather than this tool's own pacing, and it is smoothed rather than
@@ -144,7 +155,7 @@ the same factor, landing within 2 ms of their own stamps.
     --rename <OLD:NEW>        publish a stream under another name, repeatable
 -r, --rate <RATE>             2 is twice realtime, 0.5 half, 0 disables pacing [default: 1]
     --stamps <MODE>           scaled | shifted | original [default: scaled]
-    --prefix <PREFIX>         prepended to every channel or key expression
+    --prefix <PREFIX>         prepended to every name [default: / on lcm, dimos/ on zenoh]
     --start <SECONDS>         skip this far into the recording
     --duration <SECONDS>      stop after this much recording time
     --loop                    restart at the end

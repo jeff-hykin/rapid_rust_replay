@@ -138,6 +138,19 @@ fn key_expr(topic: &str) -> String {
     }
 }
 
+/// The namespace DimOS itself publishes under, mirroring `transport_topic()`
+/// in `dimos/core/transport_factory.py`: LCM channels are leading-slash paths,
+/// while Zenoh key expressions cannot start with `/` and live under `dimos`.
+///
+/// Getting this wrong is invisible — nothing subscribes, so nothing complains,
+/// and the replay reports every message as published.
+pub fn default_prefix(transport: Transport) -> &'static str {
+    match transport {
+        Transport::Lcm => "/",
+        Transport::Zenoh => "dimos/",
+    }
+}
+
 /// Builds the published name; streams with no known message type get no suffix.
 pub fn name(stream: &Stream, prefix: &str, separator: char) -> String {
     let topic = format!("{prefix}{}", stream.published);
@@ -173,9 +186,39 @@ mod tests {
         assert_eq!(name(&color, "dimos/", '/'), "dimos/color_image/sensor_msgs.Image");
     }
 
+    /// The exact strings `transport_topic()` and `zenoh_key_expr()` produce in
+    /// `dimos/core/transport_factory.py`. A replay that does not match these is
+    /// invisible to a live pipeline without reporting anything.
+    #[test]
+    fn the_default_prefix_reproduces_the_dimos_namespace() {
+        let color = stream("infrared_left", "sensor_msgs.Image");
+        assert_eq!(
+            name(&color, default_prefix(Transport::Lcm), '#'),
+            "/infrared_left#sensor_msgs.Image"
+        );
+        assert_eq!(
+            name(&color, default_prefix(Transport::Zenoh), '/'),
+            "dimos/infrared_left/sensor_msgs.Image"
+        );
+    }
+
     #[test]
     fn streams_without_a_known_type_get_no_suffix() {
         assert_eq!(name(&stream("raw", ""), "", '#'), "raw");
+    }
+
+    /// The reply topic is namespaced before it reaches `watch`, so what it has
+    /// to match is the module's real channel.
+    #[test]
+    fn a_namespaced_reply_topic_matches_the_module_channel() {
+        assert!(channel_answers("/fused_odom#nav_msgs.Odometry", "/fused_odom"));
+        assert!(!channel_answers("fused_odom#nav_msgs.Odometry", "/fused_odom"));
+
+        let declared =
+            zenoh::key_expr::KeyExpr::new(key_expr("dimos/fused_odom")).unwrap();
+        let reply =
+            zenoh::key_expr::KeyExpr::new("dimos/fused_odom/nav_msgs.Odometry").unwrap();
+        assert!(declared.intersects(&reply), "{declared} should cover {reply}");
     }
 
     #[test]

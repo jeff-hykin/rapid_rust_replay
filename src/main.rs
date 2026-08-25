@@ -64,9 +64,11 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Stamps::Scaled)]
     stamps: Stamps,
 
-    /// Prepended to every channel or key expression, e.g. `dimos/`.
-    #[arg(long, default_value = "")]
-    prefix: String,
+    /// Prepended to every channel or key expression, and to the lockstep reply
+    /// topic. Defaults to the namespace DimOS publishes under: `/` on LCM,
+    /// `dimos/` on Zenoh. Pass an empty string for unqualified names.
+    #[arg(long)]
+    prefix: Option<String>,
 
     /// Skip this many seconds from the start of the recording.
     #[arg(long, default_value_t = 0.0)]
@@ -139,6 +141,11 @@ async fn main() -> Result<()> {
             })
     };
 
+    let prefix = args
+        .prefix
+        .clone()
+        .unwrap_or_else(|| sink::default_prefix(args.transport).to_string());
+
     let mut source = Source::open(&args.input, &selector)?;
     let mut streams = source.streams().to_vec();
     rename(&mut streams, &args.renames)?;
@@ -151,7 +158,7 @@ async fn main() -> Result<()> {
                 stream.name,
                 stream.count,
                 stream.msg_name,
-                sink::name(stream, &args.prefix, separator)
+                sink::name(stream, &prefix, separator)
             );
         }
         return Ok(());
@@ -173,13 +180,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    let sink = Sink::open(args.transport, &streams, &args.prefix).await?;
+    let sink = Sink::open(args.transport, &streams, &prefix).await?;
     let mut lockstep = match &args.lockstep {
         Some(spec) => Some(
             Lockstep::open(
                 spec,
                 &streams,
                 &sink,
+                &prefix,
                 Duration::from_secs_f64(args.lockstep_timeout),
             )
             .await?,
