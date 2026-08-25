@@ -140,7 +140,7 @@ fn key_expr(topic: &str) -> String {
 
 /// Builds the published name; streams with no known message type get no suffix.
 pub fn name(stream: &Stream, prefix: &str, separator: char) -> String {
-    let topic = format!("{prefix}{}", stream.name);
+    let topic = format!("{prefix}{}", stream.published);
     if stream.msg_name.is_empty() {
         topic
     } else {
@@ -157,6 +157,7 @@ mod tests {
     fn stream(name: &str, msg_name: &str) -> Stream {
         Stream {
             name: name.into(),
+            published: name.into(),
             msg_name: msg_name.into(),
             storage: Storage::Wire,
             support: Support::None,

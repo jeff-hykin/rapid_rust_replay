@@ -33,7 +33,10 @@ fn storage_for(codec_id: &str) -> Storage {
 
 #[derive(Debug, Clone)]
 pub struct Stream {
+    /// As recorded: the SQL table name, or the mcap channel topic.
     pub name: String,
+    /// The name to publish under. Starts as `name`; `--rename` rewrites it.
+    pub published: String,
     /// e.g. `sensor_msgs.Image`; the suffix used in LCM channels and Zenoh keys.
     pub msg_name: String,
     pub storage: Storage,
@@ -155,6 +158,7 @@ impl DbSource {
                 support: stamp::support_for(&msg_name),
                 msg_name,
                 storage: storage_for(codec_id),
+                published: name.clone(),
                 name,
                 count,
             });
@@ -307,6 +311,7 @@ impl McapSource {
                 support: stamp::support_for(&msg_name),
                 msg_name,
                 storage,
+                published: name.clone(),
                 name,
                 count: counts.and_then(|counts| counts.get(id)).copied().unwrap_or(0),
             });
@@ -404,6 +409,7 @@ mod tests {
             .unwrap();
         let stream = Stream {
             name: "s".into(),
+            published: "s".into(),
             msg_name: String::new(),
             storage: Storage::Lz4,
             support: Support::None,

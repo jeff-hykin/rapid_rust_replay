@@ -55,6 +55,36 @@ somewhere specific without this tool growing a flag per knob:
 ZENOH_CONFIG=peer.json5 rrr recording.db -t zenoh
 ```
 
+## Renaming streams
+
+A recording stores each stream under the name of the module that produced it,
+which is not always the name the consumer expects. `--rename OLD:NEW` changes
+the name it is published under:
+
+```
+rrr recording.db --rename wheel_odometry:source_odometry
+```
+
+Several streams may share one `NEW`. That is not a conflict — it is how a stereo
+pair reaches a consumer that expects both imagers on one topic and tells them
+apart by `frame_id`:
+
+```
+rrr recording.db \
+  --rename infrared_left:image \
+  --rename infrared_right:image \
+  --rename infrared_left_camera_info:camera_info \
+  --rename infrared_right_camera_info:camera_info \
+  --rename camera_info:color_camera_info
+```
+
+Each `OLD` is matched against the *recorded* name, so renames never chain and
+their order does not matter — the last example moves `camera_info` out of the way
+and the infrared pair into it in one pass. For the same reason `-s/--stream` and
+`--lockstep` still name streams as the recording spells them. `--prefix` is
+applied after the rename. `--list` shows the recorded name alongside the channel
+it will actually publish on, which is the quickest way to check a mapping.
+
 ## Timestamps
 
 `--stamps` decides what happens to the timestamp inside each payload:
@@ -111,6 +141,7 @@ the same factor, landing within 2 ms of their own stamps.
 ```
 -t, --transport <lcm|zenoh>   transport to publish on [default: lcm]
 -s, --stream <NAME>           stream to replay, repeatable; trailing * matches a prefix
+    --rename <OLD:NEW>        publish a stream under another name, repeatable
 -r, --rate <RATE>             2 is twice realtime, 0.5 half, 0 disables pacing [default: 1]
     --stamps <MODE>           scaled | shifted | original [default: scaled]
     --prefix <PREFIX>         prepended to every channel or key expression

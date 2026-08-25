@@ -9,7 +9,7 @@ mod stamp;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use lockstep::Lockstep;
@@ -45,6 +45,12 @@ struct Args {
     /// Defaults to every stream.
     #[arg(short, long = "stream")]
     streams: Vec<String>,
+
+    /// Publish a stream under a different name: `OLD:NEW`, repeat for several.
+    /// Several streams may share one NEW, which is how a stereo pair reaches a
+    /// consumer that expects both imagers on one topic.
+    #[arg(long = "rename", value_name = "OLD:NEW")]
+    renames: Vec<String>,
 
     /// List the streams in the recording and exit.
     #[arg(long)]
@@ -89,6 +95,30 @@ struct Args {
     quiet: bool,
 }
 
+/// Applies `--rename OLD:NEW` to the names streams are published under.
+///
+/// Each spec is matched against the *recorded* name, so renames never chain and
+/// their order does not matter. Several may share one NEW: the sink is indexed
+/// by `Record.stream`, so two streams pointing at one channel is not a conflict.
+fn rename(streams: &mut [source::Stream], specs: &[String]) -> Result<()> {
+    for spec in specs {
+        let (old, new) = spec.split_once(':').with_context(|| {
+            format!(
+                "--rename wants OLD:NEW, for example wheel_odometry:source_odometry, not {spec}"
+            )
+        })?;
+        if new.is_empty() {
+            bail!("--rename {spec} leaves an empty name");
+        }
+        let stream = streams
+            .iter_mut()
+            .find(|stream| stream.name == old)
+            .with_context(|| format!("--rename {spec}: no stream named {old} is being replayed"))?;
+        stream.published = new.to_string();
+    }
+    Ok(())
+}
+
 fn now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
@@ -110,7 +140,8 @@ async fn main() -> Result<()> {
     };
 
     let mut source = Source::open(&args.input, &selector)?;
-    let streams = source.streams().to_vec();
+    let mut streams = source.streams().to_vec();
+    rename(&mut streams, &args.renames)?;
 
     if args.list {
         let separator = if args.transport == Transport::Lcm { '#' } else { '/' };
@@ -322,5 +353,85 @@ async fn sleep_until(target: Instant) {
     }
     while Instant::now() < target {
         tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use source::{Storage, Stream};
+
+    fn streams(names: &[&str]) -> Vec<Stream> {
+        names
+            .iter()
+            .map(|name| Stream {
+                name: (*name).into(),
+                published: (*name).into(),
+                msg_name: "sensor_msgs.Image".into(),
+                storage: Storage::Wire,
+                support: Support::None,
+                count: 0,
+            })
+            .collect()
+    }
+
+    fn specs(specs: &[&str]) -> Vec<String> {
+        specs.iter().map(|spec| (*spec).to_string()).collect()
+    }
+
+    /// DimSlam tells its cameras apart by `frame_id`, so both imagers have to
+    /// arrive on one topic. A shared target is the point, not a conflict.
+    #[test]
+    fn several_streams_may_share_one_published_name() {
+        let mut streams = streams(&["infrared_left", "infrared_right"]);
+        rename(&mut streams, &specs(&["infrared_left:image", "infrared_right:image"])).unwrap();
+
+        let channels: Vec<_> = streams.iter().map(|stream| sink::name(stream, "", '#')).collect();
+        assert_eq!(channels, ["image#sensor_msgs.Image", "image#sensor_msgs.Image"]);
+    }
+
+    /// The recorded name stays put, so `-s` and `--lockstep` keep matching the
+    /// file rather than the wire.
+    #[test]
+    fn renaming_leaves_the_recorded_name_alone() {
+        let mut streams = streams(&["wheel_odometry"]);
+        rename(&mut streams, &specs(&["wheel_odometry:source_odometry"])).unwrap();
+        assert_eq!(streams[0].name, "wheel_odometry");
+        assert_eq!(streams[0].published, "source_odometry");
+    }
+
+    /// Matching on the recorded name means `a:b` then `b:c` cannot pick up its
+    /// own output, so the specs may be given in any order.
+    #[test]
+    fn renames_do_not_chain() {
+        let mut streams = streams(&["camera_info", "infrared_left_camera_info"]);
+        rename(
+            &mut streams,
+            &specs(&["camera_info:color_camera_info", "infrared_left_camera_info:camera_info"]),
+        )
+        .unwrap();
+        assert_eq!(streams[0].published, "color_camera_info");
+        assert_eq!(streams[1].published, "camera_info");
+    }
+
+    #[test]
+    fn the_prefix_is_applied_after_the_rename() {
+        let mut streams = streams(&["infrared_left"]);
+        rename(&mut streams, &specs(&["infrared_left:image"])).unwrap();
+        assert_eq!(sink::name(&streams[0], "dimos/", '/'), "dimos/image/sensor_msgs.Image");
+    }
+
+    #[test]
+    fn a_rename_of_a_stream_that_is_not_replayed_is_an_error() {
+        let mut streams = streams(&["color_image"]);
+        let error = rename(&mut streams, &specs(&["lidar:points"])).unwrap_err().to_string();
+        assert!(error.contains("no stream named lidar"), "{error}");
+    }
+
+    #[test]
+    fn a_rename_without_a_colon_is_an_error() {
+        let mut streams = streams(&["color_image"]);
+        assert!(rename(&mut streams, &specs(&["color_image"])).is_err());
+        assert!(rename(&mut streams, &specs(&["color_image:"])).is_err());
     }
 }
