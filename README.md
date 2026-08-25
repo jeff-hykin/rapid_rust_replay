@@ -3,7 +3,7 @@
 Replays a DimOS recording — a memory2 `.db` or an `.mcap` — onto LCM or Zenoh,
 re-stamping each message so subscribers see it as live data.
 
-```
+```sh
 rrr recording.db                       # replay every stream on LCM at 1x
 rrr recording.db --list                # what is in the file
 rrr recording.db -s color_image -r 0.5 # one stream, half speed
@@ -14,13 +14,13 @@ rrr recording.db --lockstep wheel_odom:fused_odom   # let the consumer set the p
 
 ## Install
 
-```
+```sh
 nix profile install github:jeff-hykin/rapid_rust_replay
 ```
 
 Or run it without installing anything:
 
-```
+```sh
 nix run github:jeff-hykin/rapid_rust_replay -- recording.db --list
 ```
 
@@ -51,7 +51,7 @@ stream names never carry one. `--prefix` is prepended to both.
 Zenoh sessions honour `ZENOH_CONFIG`, so endpoints and scouting can be pointed
 somewhere specific without this tool growing a flag per knob:
 
-```
+```sh
 ZENOH_CONFIG=peer.json5 rrr recording.db -t zenoh
 ```
 
