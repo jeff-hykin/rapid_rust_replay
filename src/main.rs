@@ -1,6 +1,7 @@
 //! Replay a dimos recording (`.db` or `.mcap`) onto LCM or Zenoh.
 
 mod cdr;
+mod lockstep;
 mod sink;
 mod source;
 mod stamp;
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Result};
 use clap::Parser;
 
+use lockstep::Lockstep;
 use sink::{Sink, Transport};
 use source::{Source, Storage};
 use stamp::{Retimer, Support};
@@ -72,6 +74,16 @@ struct Args {
     #[arg(long = "loop")]
     repeat: bool,
 
+    /// Let a downstream node set the pace: `STREAM:TOPIC`, e.g.
+    /// `wheel_odom:fused_odom`. Each publish of the stream waits to be answered
+    /// on the topic, so a consumer that keeps up replays faster than realtime.
+    #[arg(long, value_name = "STREAM:TOPIC")]
+    lockstep: Option<String>,
+
+    /// How long a lockstep reply may take before the replay moves on without it.
+    #[arg(long, default_value_t = 1.0, value_name = "SECONDS")]
+    lockstep_timeout: f64,
+
     /// Only report errors.
     #[arg(short, long)]
     quiet: bool,
@@ -131,6 +143,19 @@ async fn main() -> Result<()> {
     }
 
     let sink = Sink::open(args.transport, &streams, &args.prefix).await?;
+    let mut lockstep = match &args.lockstep {
+        Some(spec) => Some(
+            Lockstep::open(
+                spec,
+                &streams,
+                &sink,
+                Duration::from_secs_f64(args.lockstep_timeout),
+            )
+            .await?,
+        ),
+        None => None,
+    };
+
     if !args.quiet {
         eprintln!(
             "replaying {} stream(s) from {} at {}",
@@ -141,14 +166,17 @@ async fn main() -> Result<()> {
         for name in sink.names() {
             eprintln!("  -> {name}");
         }
+        if let Some(spec) = &args.lockstep {
+            eprintln!("lockstep: {spec} (up to {}s per reply)", args.lockstep_timeout);
+        }
     }
 
-    let mut published: u64 = 0;
-    let mut skipped: u64 = 0;
+    let mut total = Tally::default();
     loop {
-        let (sent, dropped) = replay_once(&mut source, &streams, &sink, &args).await?;
-        published += sent;
-        skipped += dropped;
+        let pass = replay_once(&mut source, &streams, &sink, &args, lockstep.as_mut()).await?;
+        total.published += pass.published;
+        total.skipped += pass.skipped;
+        total.restamped += pass.restamped;
         if !args.repeat {
             break;
         }
@@ -156,12 +184,46 @@ async fn main() -> Result<()> {
     }
 
     if !args.quiet {
-        eprintln!("published {published} message(s)");
-        if skipped > 0 {
-            eprintln!("skipped {skipped} message(s)");
+        eprintln!("published {} message(s)", total.published);
+        if total.skipped > 0 {
+            eprintln!("skipped {} message(s)", total.skipped);
+        }
+        if total.restamped > 0 {
+            eprintln!(
+                "{} message(s) carried a stamp from another clock; \
+                 used the recorded arrival time instead",
+                total.restamped
+            );
+        }
+        if let Some(lockstep) = &lockstep {
+            if lockstep.timeouts > 0 {
+                eprintln!("{} lockstep reply(s) never arrived", lockstep.timeouts);
+            }
         }
     }
     Ok(())
+}
+
+/// Where the recording clock was last pinned to the replay clock.
+///
+/// Without lockstep this is set once and never moves, which is the plain
+/// `elapsed / rate` pacing. Lockstep re-pins it at every gate publish, so both
+/// the emission times and the stamps of the messages that follow are measured
+/// from a point that actually happened rather than from one predicted at the
+/// start of the file.
+struct Anchor {
+    recorded: f64,
+    wall: Instant,
+    wall_ns: i64,
+}
+
+#[derive(Default)]
+struct Tally {
+    published: u64,
+    /// Messages whose payload had no LCM wire form.
+    skipped: u64,
+    /// Messages whose own stamp was unusable, so recorded arrival time stood in.
+    restamped: u64,
 }
 
 async fn replay_once(
@@ -169,58 +231,81 @@ async fn replay_once(
     streams: &[source::Stream],
     sink: &Sink,
     args: &Args,
-) -> Result<(u64, u64)> {
+    mut lockstep: Option<&mut Lockstep>,
+) -> Result<Tally> {
     let mut base: Option<f64> = None;
-    let mut start_wall = Instant::now();
+    let mut anchor: Option<Anchor> = None;
+    let mut rate = if args.rate == 0.0 { 1.0 } else { args.rate };
     let mut retimer = Retimer::Original;
-    let mut published = 0;
-    let mut skipped = 0;
+    let mut tally = Tally::default();
 
     while let Some(record) = source.next()? {
         let stream = &streams[record.stream];
         if stream.storage == Storage::Unsupported {
-            skipped += 1;
+            tally.skipped += 1;
             continue;
         }
 
         // The first message that survives filtering anchors both clocks.
-        let base = *base.get_or_insert_with(|| {
-            start_wall = Instant::now();
-            let base = record.ts + args.start;
+        let base = *base.get_or_insert(record.ts + args.start);
+        let anchor = anchor.get_or_insert_with(|| {
+            let wall_ns = stamp::seconds_to_nanos(now());
             let base_ns = stamp::seconds_to_nanos(base);
-            let now_ns = stamp::seconds_to_nanos(now());
             retimer = match args.stamps {
                 Stamps::Original => Retimer::Original,
-                Stamps::Shifted => Retimer::Shifted { delta_ns: now_ns - base_ns },
-                Stamps::Scaled => Retimer::Scaled {
-                    first_ns: base_ns,
-                    start_wall_ns: now_ns,
-                    rate: if args.rate == 0.0 { 1.0 } else { args.rate },
-                },
+                Stamps::Shifted => Retimer::Shifted { delta_ns: wall_ns - base_ns },
+                Stamps::Scaled => {
+                    Retimer::Scaled { first_ns: base_ns, start_wall_ns: wall_ns, rate }
+                }
             };
-            base
+            Anchor { recorded: base, wall: Instant::now(), wall_ns }
         });
 
         let elapsed = record.ts - base;
         if elapsed < 0.0 {
-            skipped += 1;
+            tally.skipped += 1;
             continue;
         }
         if args.duration.is_some_and(|limit| elapsed > limit) {
             break;
         }
 
-        if args.rate > 0.0 {
-            sleep_until(start_wall + Duration::from_secs_f64(elapsed / args.rate)).await;
+        let gate = lockstep.as_ref().is_some_and(|lockstep| lockstep.stream == record.stream);
+        if gate {
+            // A gate message is released by the downstream node, not by the
+            // clock, so it skips its wall deadline entirely — that is what lets
+            // a consumer that keeps up pull the recording along faster.
+            if let Some(lockstep) = lockstep.as_mut() {
+                lockstep.wait(record.ts, &mut rate).await;
+            }
+            anchor.recorded = record.ts;
+            anchor.wall = Instant::now();
+            anchor.wall_ns = stamp::seconds_to_nanos(now());
+            if let Retimer::Scaled { first_ns, start_wall_ns, rate: scaled } = &mut retimer {
+                *first_ns = stamp::seconds_to_nanos(anchor.recorded);
+                *start_wall_ns = anchor.wall_ns;
+                *scaled = rate;
+            }
+        } else if args.rate > 0.0 {
+            let ahead = (record.ts - anchor.recorded).max(0.0);
+            sleep_until(anchor.wall + Duration::from_secs_f64(ahead / rate)).await;
         }
 
         let mut data = source::to_wire(stream, record.data)?;
-        retimer.apply(stream.support, &mut data, stamp::seconds_to_nanos(record.ts))?;
+        if retimer.apply(stream.support, &mut data, stamp::seconds_to_nanos(record.ts))? {
+            tally.restamped += 1;
+        }
         sink.publish(record.stream, data).await?;
-        published += 1;
+        tally.published += 1;
+
+        if gate {
+            if let Some(lockstep) = lockstep.as_mut() {
+                lockstep.sent(record.ts, Instant::now());
+            }
+        }
     }
 
-    Ok((published, skipped))
+    Ok(tally)
 }
 
 /// Sleeps to just short of `target`, then yields until it arrives.

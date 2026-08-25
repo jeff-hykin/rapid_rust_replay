@@ -60,6 +60,17 @@ pub fn support_for(msg_name: &str) -> Support {
 
 pub const NANOS_PER_SEC: i64 = 1_000_000_000;
 
+/// How far a payload stamp may sit from the moment the recorder received the
+/// message before we stop believing the two are on the same clock.
+///
+/// Some drivers stamp with system uptime rather than the epoch — `china_office.db`
+/// has `color_image` frames stamped `sec=1278` next to a recorded arrival of
+/// `1781260015`. Mapped as if it were a recording time, a stamp like that lands
+/// before 1970 and gets flattened to zero, which is worse than useless to a
+/// subscriber. An hour is far beyond any real sensor latency and still nowhere
+/// near an uptime clock.
+const SAME_CLOCK_NS: i64 = 3600 * NANOS_PER_SEC;
+
 pub fn seconds_to_nanos(seconds: f64) -> i64 {
     if !seconds.is_finite() || seconds <= 0.0 {
         return 0;
@@ -97,14 +108,15 @@ impl Retimer {
 
     /// Rewrites the payload's stamps in place.
     ///
-    /// `fallback_ns` stands in when the recorded stamp is unset (`sec <= 0`),
-    /// matching how the dimos recorder falls back to reception time.
-    pub fn apply(&self, support: Support, buf: &mut Vec<u8>, fallback_ns: i64) -> Result<()> {
+    /// `received_ns` is when the recorder took delivery of the message. It
+    /// stands in whenever the payload's own stamp is unset (`sec <= 0`) or is
+    /// plainly on another clock, and the return value reports that it had to.
+    pub fn apply(&self, support: Support, buf: &mut Vec<u8>, received_ns: i64) -> Result<bool> {
         if matches!(self, Retimer::Original) {
-            return Ok(());
+            return Ok(false);
         }
         match support {
-            Support::None => Ok(()),
+            Support::None => Ok(false),
             Support::Fixed(offset) => {
                 if buf.len() < offset + 8 {
                     anyhow::bail!(
@@ -112,24 +124,34 @@ impl Retimer {
                         buf.len()
                     );
                 }
-                let original = read_nanos(buf, offset).unwrap_or(fallback_ns);
-                write_nanos(buf, offset, self.map(original));
-                Ok(())
+                let recorded = read_nanos(buf, offset).filter(|ns| same_clock(*ns, received_ns));
+                write_nanos(buf, offset, self.map(recorded.unwrap_or(received_ns)));
+                Ok(recorded.is_none())
             }
             Support::TfMessage => {
                 let mut message = TFMessage::decode(buf).context("invalid LCM TFMessage")?;
+                let mut substituted = false;
                 for transform in &mut message.transforms {
                     let stamp = &mut transform.header.stamp;
-                    let original = nanos_from_parts(stamp.sec, stamp.nsec).unwrap_or(fallback_ns);
-                    let (sec, nsec) = nanos_to_parts(self.map(original));
+                    let recorded = nanos_from_parts(stamp.sec, stamp.nsec)
+                        .filter(|ns| same_clock(*ns, received_ns));
+                    substituted |= recorded.is_none();
+                    let (sec, nsec) = nanos_to_parts(self.map(recorded.unwrap_or(received_ns)));
                     stamp.sec = sec;
                     stamp.nsec = nsec;
                 }
                 *buf = message.encode();
-                Ok(())
+                Ok(substituted)
             }
         }
     }
+}
+
+/// Whether a payload stamp reads as coming from the clock the recorder used.
+/// With no reception time to compare against, the payload gets the benefit of
+/// the doubt.
+fn same_clock(stamp_ns: i64, received_ns: i64) -> bool {
+    received_ns == 0 || (stamp_ns - received_ns).abs() < SAME_CLOCK_NS
 }
 
 fn read_nanos(buf: &[u8], offset: usize) -> Option<i64> {
@@ -282,6 +304,39 @@ mod tests {
             child_frame_id: child.into(),
             ..Default::default()
         }
+    }
+
+    /// A driver that stamps with system uptime must not drag the message back
+    /// to 1970; reception time is the only usable clock in that case.
+    #[test]
+    fn stamps_from_another_clock_fall_back_to_reception_time() {
+        let uptime = Header { stamp: Time { sec: 1278, nsec: 135_574_598 }, ..header() };
+        let mut buf =
+            lcm_msgs::sensor_msgs::Image { header: uptime, ..Default::default() }.encode();
+        let received_ns = 1_781_260_015 * NANOS_PER_SEC;
+
+        let substituted = Retimer::Shifted { delta_ns: 0 }
+            .apply(support_for("sensor_msgs.Image"), &mut buf, received_ns)
+            .unwrap();
+
+        assert!(substituted, "an uptime stamp should be reported, not silently used");
+        let decoded = lcm_msgs::sensor_msgs::Image::decode(&buf).unwrap();
+        assert_eq!(decoded.header.stamp.sec, 1_781_260_015);
+    }
+
+    #[test]
+    fn a_stamp_on_the_recorders_clock_is_kept() {
+        let mut buf =
+            lcm_msgs::sensor_msgs::Image { header: header(), ..Default::default() }.encode();
+        let received_ns = i64::from(SEC) * NANOS_PER_SEC + 4 * NANOS_PER_SEC;
+
+        let substituted = Retimer::Shifted { delta_ns: 0 }
+            .apply(support_for("sensor_msgs.Image"), &mut buf, received_ns)
+            .unwrap();
+
+        assert!(!substituted);
+        let decoded = lcm_msgs::sensor_msgs::Image::decode(&buf).unwrap();
+        assert_eq!(decoded.header.stamp.nsec, NSEC);
     }
 
     #[test]

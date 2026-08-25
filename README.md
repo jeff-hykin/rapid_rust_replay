@@ -8,6 +8,8 @@ rrr recording.db                       # replay every stream on LCM at 1x
 rrr recording.db --list                # what is in the file
 rrr recording.db -s color_image -r 0.5 # one stream, half speed
 rrr recording.mcap -t zenoh --loop     # onto Zenoh, forever
+
+rrr recording.db --lockstep wheel_odom:fused_odom   # let the consumer set the pace
 ```
 
 ## Install
@@ -71,6 +73,39 @@ untouched, with a warning.
 All of it is integer nanoseconds; a float Unix timestamp only resolves to about
 100 ns, which is enough to perturb the field it is meant to preserve.
 
+Some drivers stamp with system uptime rather than the epoch, and a recording can
+mix the two within one stream. A stamp more than an hour from when the recorder
+took delivery of the message is treated as coming from another clock, and the
+recorded arrival time is used instead — mapping it as-is would land the message
+before 1970. The count is reported at the end of the run rather than passed
+along silently.
+
+## Lockstep
+
+`--lockstep wheel_odom:fused_odom` hands the pace to whatever is consuming the
+replay. Every `wheel_odom` publish waits for the `fused_odom` that answers the
+one before it, so a consumer that keeps up pulls the recording along faster than
+realtime, and one that falls behind slows it down. `--lockstep-timeout` (1s by
+default) is the escape hatch when nothing answers; those are counted and
+reported.
+
+The reply topic is matched as a family, so `fused_odom` also accepts
+`fused_odom#nav_msgs.Odometry` on LCM and `fused_odom/nav_msgs.Odometry` on
+Zenoh. It is taken literally and `--prefix` is not applied to it.
+
+How fast the replies come back is measured from each publish, so it reflects the
+consumer rather than this tool's own pacing, and it is smoothed rather than
+taken one cycle at a time. That rate then spreads the messages *between* two
+gate publishes — the camera frames between two odometry ticks — across the same
+interval, so their stamps stay where they belong relative to the gate messages
+around them. `--rate` sets the starting estimate; `--rate 0` gates on the
+replies alone and emits everything in between as fast as it can.
+
+Measured against a 4-second slice of `china_office.db`, gating `go2_odom` on a
+consumer answering in ~40 ms per cycle: it ran at 1.22x, gate spacing compressed
+from 53.4 ms to 43.8 ms, and the `livox_imu` messages in between compressed by
+the same factor, landing within 2 ms of their own stamps.
+
 ## Options
 
 ```
@@ -82,6 +117,8 @@ All of it is integer nanoseconds; a float Unix timestamp only resolves to about
     --start <SECONDS>         skip this far into the recording
     --duration <SECONDS>      stop after this much recording time
     --loop                    restart at the end
+    --lockstep <STREAM:TOPIC> gate the stream on a reply from the topic
+    --lockstep-timeout <SECS> how long a reply may take [default: 1]
     --list                    list streams and exit
 -q, --quiet                   only report errors
 ```
