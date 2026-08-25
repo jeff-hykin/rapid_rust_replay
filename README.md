@@ -10,6 +10,8 @@ rrr recording.db -s color_image -r 0.5 # one stream, half speed
 rrr recording.mcap -t zenoh --loop     # onto Zenoh, forever
 
 rrr recording.db --lockstep wheel_odom:fused_odom   # let the consumer set the pace
+
+rrr --record '["color_image"]' --record-to out.mcap  # capture live traffic instead
 ```
 
 ## Install
@@ -31,7 +33,7 @@ From a checkout, `cargo install --path .` works too.
 | Source | Payload | Notes |
 | --- | --- | --- |
 | memory2 `.db` | `lcm`, `jpeg`, `lz4+lcm`, `lz4+jpeg` | stored bytes are already LCM wire bytes |
-| `.mcap`, `message_encoding: lcm` | LCM | written by the DimOS native recorder |
+| `.mcap`, `message_encoding: lcm` etc. | LCM | the same storage codecs, written by the DimOS native recorder or by `--record` |
 | `.mcap`, `message_encoding: cdr` | ROS 2 | transcoded to LCM per message |
 
 Streams stored as Python pickles, and CDR types with no LCM counterpart, are
@@ -64,6 +66,70 @@ somewhere specific without this tool growing a flag per knob:
 ```sh
 ZENOH_CONFIG=peer.json5 rrr recording.db -t zenoh
 ```
+
+## Recording
+
+`--record` captures what is on the transport into an `.mcap`. It is live: what
+lands in the file is what the graph actually put on the wire, not a copy of a
+file that already exists.
+
+```sh
+rrr --record '["color_image"]' --record-to session.mcap
+```
+
+With no recording to replay, that is the whole program — it subscribes, writes,
+and stops on ctrl-c. The list also accepts `color_image,lidar` and a repeated
+`--record`, and an empty list records every stream that turns up.
+`--record-all-but` is the other side of it, and narrows `--record` when both are
+given:
+
+```sh
+rrr --record-all-but '["color_image","depth_image"]' --record-to session.mcap
+```
+
+Recording during a replay records everything *except* what the replay itself is
+publishing:
+
+```sh
+rrr recording.db --record '["fused_odom"]' --record-to answers.mcap
+```
+
+Both transports deliver to their own subscribers, so without that a replay would
+write its own output straight back into the file. A published message is matched
+on its channel and the timestamp inside its payload — not on a hash of the bytes,
+which at 400 KB a frame would cost more than the recording does. The consequence
+is worth knowing: for the few seconds a message is remembered, a *second*
+publisher echoing the replay's exact stamp on the same channel is indistinguishable
+from the replay, so recording a topic you are also replaying is a narrower
+question than it looks.
+
+The file follows the same convention `rrr` reads: one channel per stream, LCM
+wire bytes as the payload, the python type in `dimos.payload_type` and the stream
+name in `dimos.stream_name`. `publish_time` is the timestamp inside the payload
+and `log_time` is when the recorder took delivery, which is what makes the gap
+between them readable afterwards.
+
+Payloads are stored as raw LCM bytes in zstd-compressed chunks. Both are
+adjustable, and the per-stream override is the one that pays: depth images and
+point clouds are mostly repeated bytes.
+
+```sh
+rrr --record '[]' --record-to session.mcap \
+  --record-codec depth_image:lz4+lcm \
+  --record-codec lidar:lz4+lcm \
+  --record-compression zstd
+```
+
+`--record-codec` takes `lcm` or `lz4+lcm`, `--record-codec-default` sets the
+codec for everything else, and `--record-compression` is `zstd`, `lz4` or `none`.
+
+Free space is checked before recording starts and anything under 6 GB is called
+out — a recording with images in it fills that in minutes. It is a warning, not a
+refusal.
+
+Ctrl-C during a recording finalizes the file rather than killing the process. An
+mcap without its summary section cannot be enumerated at all, so the difference
+is between a short recording and no recording.
 
 ## Renaming streams
 
@@ -242,9 +308,18 @@ the same factor, landing within 2 ms of their own stamps.
     --loop                    restart at the end
     --lockstep <STREAM:TOPIC> gate the stream on a reply from the topic
     --lockstep-timeout <SECS> how long a reply may take [default: 1]
+    --record <STREAMS>        capture these streams off the transport into an mcap
+    --record-all-but <STREAMS>  capture everything except these
+    --record-to <PATH>        where the recording is written
+    --record-codec <NAME:CODEC> per-stream payload codec: lcm | lz4+lcm
+    --record-codec-default <CODEC>  codec for every other stream [default: lcm]
+    --record-compression <C>  chunk compression: zstd | lz4 | none [default: zstd]
     --list                    list streams and exit
 -q, --quiet                   only report errors
 ```
+
+The recording to replay is the one positional argument, and it is optional: with
+`--record` and no recording, `rrr` only records.
 
 ## Pacing
 

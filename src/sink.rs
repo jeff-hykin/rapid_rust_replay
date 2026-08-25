@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use dimos_lcm::Lcm;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use zenoh::pubsub::Publisher;
 use zenoh::Session;
 
@@ -109,6 +109,62 @@ impl Sink {
             }
         }
         Ok(receiver)
+    }
+
+    /// Every message on the transport, as `(channel, payload)`.
+    ///
+    /// LCM has no per-channel subscribe — `recv()` hands over the whole group —
+    /// so filtering is the caller's job on both transports and the Zenoh side
+    /// declares one wildcard subscriber to match.
+    pub async fn subscribe_all(
+        &self,
+        prefix: &str,
+    ) -> Result<mpsc::UnboundedReceiver<(String, Vec<u8>)>> {
+        let (messages, receiver) = mpsc::unbounded_channel();
+        match self {
+            Sink::Lcm { lcm, .. } => {
+                let lcm = Arc::clone(lcm);
+                tokio::spawn(async move {
+                    while let Ok(message) = lcm.recv().await {
+                        if messages.send((message.channel, message.data)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            Sink::Zenoh { session, .. } => {
+                let key = format!("{}**", prefix.trim_start_matches('/'));
+                let subscriber = session
+                    .declare_subscriber(key.clone())
+                    .await
+                    .map_err(|error| anyhow::anyhow!("failed to subscribe to {key}: {error}"))?;
+                tokio::spawn(async move {
+                    while let Ok(sample) = subscriber.recv_async().await {
+                        let channel = sample.key_expr().to_string();
+                        let payload = sample.payload().to_bytes().into_owned();
+                        if messages.send((channel, payload)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+        Ok(receiver)
+    }
+
+    /// The exact name a stream publishes under, as the recorder will hear it.
+    pub fn channel(&self, stream: usize) -> &str {
+        match self {
+            Sink::Lcm { channels, .. } => &channels[stream],
+            Sink::Zenoh { publishers, .. } => publishers[stream].key_expr().as_str(),
+        }
+    }
+
+    pub fn transport(&self) -> Transport {
+        match self {
+            Sink::Lcm { .. } => Transport::Lcm,
+            Sink::Zenoh { .. } => Transport::Zenoh,
+        }
     }
 
     /// The channel or key each stream publishes on, for `--list` and logging.

@@ -256,6 +256,24 @@ pub struct McapSource {
     messages: mcap::MessageStream<'static>,
 }
 
+/// What an mcap channel's `message_encoding` says about its payload.
+///
+/// dimos puts the *storage codec* there — `lcm`, `jpeg`, `lz4+lcm` — and names
+/// the python type in channel metadata, so the encodings are the same set the
+/// `.db` reader knows. rosbag2 and `db_to_mcap` write `cdr` and a ROS schema
+/// name instead.
+fn channel_kind(encoding: &str, payload_type: &str, schema: &str) -> (String, Storage) {
+    if encoding == "cdr" {
+        let msg_name = crate::cdr::msg_name_from_schema(schema);
+        let storage = match crate::cdr::supports(&msg_name) {
+            true => Storage::Cdr,
+            false => Storage::Unsupported,
+        };
+        return (msg_name, storage);
+    }
+    (msg_name_from_payload_module(payload_type), storage_for(encoding))
+}
+
 impl McapSource {
     fn open(path: &Path, selector: &dyn Fn(&str) -> bool) -> Result<Self> {
         let file = std::fs::File::open(path)
@@ -281,31 +299,11 @@ impl McapSource {
             if !selector(&name) {
                 continue;
             }
-            // dimos's own recorder stores LCM bytes and names the python type in
-            // channel metadata; rosbag2 and `db_to_mcap` store CDR under a ROS
-            // schema name.
-            let (msg_name, storage) = match channel.message_encoding.as_str() {
-                "lcm" => {
-                    let payload_module = channel
-                        .metadata
-                        .get("dimos.payload_type")
-                        .map(String::as_str)
-                        .unwrap_or_default();
-                    (msg_name_from_payload_module(payload_module), Storage::Wire)
-                }
-                "cdr" => {
-                    let schema =
-                        channel.schema.as_ref().map(|schema| schema.name.clone()).unwrap_or_default();
-                    let msg_name = crate::cdr::msg_name_from_schema(&schema);
-                    let storage = if crate::cdr::supports(&msg_name) {
-                        Storage::Cdr
-                    } else {
-                        Storage::Unsupported
-                    };
-                    (msg_name, storage)
-                }
-                _ => (String::new(), Storage::Unsupported),
-            };
+            let (msg_name, storage) = channel_kind(
+                &channel.message_encoding,
+                channel.metadata.get("dimos.payload_type").map(String::as_str).unwrap_or_default(),
+                channel.schema.as_ref().map(|schema| schema.name.as_str()).unwrap_or_default(),
+            );
             by_topic.insert(channel.topic.clone(), streams.len());
             streams.push(Stream {
                 support: stamp::support_for(&msg_name),
@@ -394,6 +392,29 @@ mod tests {
     fn msg_name_passes_through_names_that_are_already_short() {
         assert_eq!(msg_name_from_payload_module("sensor_msgs.Image"), "sensor_msgs.Image");
         assert_eq!(msg_name_from_payload_module(""), "");
+    }
+
+    /// An mcap channel carries the storage codec, not just `lcm` — a recording
+    /// written with `--record-codec lidar:lz4+lcm` has to replay again.
+    #[test]
+    fn mcap_channels_carry_the_same_storage_codecs_as_the_db() {
+        let image = "dimos.msgs.sensor_msgs.Image.Image";
+        assert_eq!(channel_kind("lcm", image, ""), ("sensor_msgs.Image".into(), Storage::Wire));
+        assert_eq!(channel_kind("jpeg", image, ""), ("sensor_msgs.Image".into(), Storage::Wire));
+        assert_eq!(channel_kind("lz4+lcm", image, ""), ("sensor_msgs.Image".into(), Storage::Lz4));
+        assert_eq!(
+            channel_kind("protobuf", image, "").1,
+            Storage::Unsupported,
+            "an encoding this tool cannot turn into LCM bytes must not be replayed"
+        );
+    }
+
+    #[test]
+    fn mcap_cdr_channels_are_typed_from_their_schema() {
+        assert_eq!(
+            channel_kind("cdr", "", "sensor_msgs/msg/Image"),
+            ("sensor_msgs.Image".into(), Storage::Cdr)
+        );
     }
 
     #[test]

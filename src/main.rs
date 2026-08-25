@@ -2,6 +2,7 @@
 
 mod cdr;
 mod lockstep;
+mod record;
 mod sink;
 mod source;
 mod stamp;
@@ -13,6 +14,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use lockstep::Lockstep;
+use record::{Codec, Compression, Recorder, Selection};
 use sink::{Sink, Transport};
 use source::{Source, Storage};
 use stamp::{Retimer, Support};
@@ -34,8 +36,9 @@ enum Stamps {
     version
 )]
 struct Args {
-    /// Recording to replay (`.db` or `.mcap`).
-    input: PathBuf,
+    /// Recording to replay (`.db` or `.mcap`). Optional with `--record`, which
+    /// then captures live traffic without replaying anything.
+    input: Option<PathBuf>,
 
     /// Transport to publish on.
     #[arg(short, long, value_enum, default_value_t = Transport::Lcm)]
@@ -97,6 +100,34 @@ struct Args {
     #[arg(long, default_value_t = 1.0, value_name = "SECONDS")]
     lockstep_timeout: f64,
 
+    /// Record these streams off the transport into an mcap:
+    /// `--record '["color_image"]'`. Comma-separated and repeated forms work
+    /// too, and an empty list records every stream that turns up.
+    #[arg(long = "record", value_name = "STREAMS")]
+    record: Vec<String>,
+
+    /// Record everything except these streams; same spelling as `--record`.
+    /// Repeatable, and it narrows `--record` when both are given.
+    #[arg(long = "record-all-but", value_name = "STREAMS")]
+    record_all_but: Vec<String>,
+
+    /// Where the recording is written. Required to record.
+    #[arg(long = "record-to", value_name = "PATH")]
+    record_to: Option<PathBuf>,
+
+    /// How each stream's payload is stored.
+    #[arg(long = "record-codec-default", value_enum, default_value_t = Codec::Lcm)]
+    record_codec_default: Codec,
+
+    /// Override the codec for one stream: `NAME:CODEC`, repeat for several.
+    /// CODEC is `lcm` or `lz4+lcm`.
+    #[arg(long = "record-codec", value_name = "NAME:CODEC")]
+    record_codecs: Vec<String>,
+
+    /// How the file's chunks are compressed, on top of the per-stream codec.
+    #[arg(long = "record-compression", value_enum, default_value_t = Compression::Zstd)]
+    record_compression: Compression,
+
     /// Only report errors.
     #[arg(short, long)]
     quiet: bool,
@@ -151,7 +182,26 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| sink::default_prefix(args.transport).to_string());
 
-    let mut source = Source::open(&args.input, &selector)?;
+    let recording = !args.record.is_empty() || !args.record_all_but.is_empty();
+    if args.record_to.is_some() && !recording {
+        bail!("--record-to needs --record (or --record-all-but) to say what to capture");
+    }
+    let Some(input) = args.input.clone() else {
+        if !recording {
+            bail!("give a recording to replay, or --record STREAMS to capture live traffic");
+        }
+        let sink = Sink::open(args.transport, &[], &prefix).await?;
+        let recorder = start_recorder(&args, &sink, &prefix).await?;
+        if !args.quiet {
+            eprintln!("recording from {:?}; press ctrl-c to stop", args.transport);
+        }
+        tokio::signal::ctrl_c().await?;
+        eprintln!();
+        eprint!("{}", recorder.finish().await?);
+        return Ok(());
+    };
+
+    let mut source = Source::open(&input, &selector)?;
     let mut streams = source.streams().to_vec();
     rename(&mut streams, &args.renames)?;
 
@@ -186,6 +236,10 @@ async fn main() -> Result<()> {
     }
 
     let sink = Sink::open(args.transport, &streams, &prefix).await?;
+    let recorder = match recording {
+        true => Some(start_recorder(&args, &sink, &prefix).await?),
+        false => None,
+    };
     let mut lockstep = match &args.lockstep {
         Some(spec) => Some(
             Lockstep::open(
@@ -204,7 +258,7 @@ async fn main() -> Result<()> {
         eprintln!(
             "replaying {} stream(s) from {} at {}",
             streams.len(),
-            args.input.display(),
+            input.display(),
             if args.rate == 0.0 { "max speed".into() } else { format!("{}x", args.rate) }
         );
         for name in sink.names() {
@@ -223,24 +277,26 @@ async fn main() -> Result<()> {
     let mut audit = stamp::Audit::new(streams.iter().map(|stream| stream.name.clone()));
 
     let mut total = Tally::default();
-    loop {
-        let pass = replay_once(
-            &mut source,
-            &streams,
-            &sink,
-            &args,
-            lockstep.as_mut(),
-            tf.as_mut(),
-            &mut audit,
-        )
-        .await?;
-        total.published += pass.published;
-        total.skipped += pass.skipped;
-        total.restamped += pass.restamped;
-        if !args.repeat {
-            break;
-        }
-        source.rewind()?;
+    let replaying = replay_all(
+        &mut source,
+        &streams,
+        &sink,
+        &args,
+        lockstep.as_mut(),
+        tf.as_mut(),
+        &mut audit,
+        recorder.as_ref(),
+        &mut total,
+    );
+    // Ctrl-C has to unwind rather than kill the process: an mcap with no
+    // summary section cannot be enumerated, so an unfinalized file is lost.
+    tokio::select! {
+        result = replaying => result?,
+        _ = tokio::signal::ctrl_c() => eprintln!(),
+    }
+
+    if let Some(recorder) = recorder {
+        eprint!("{}", recorder.finish().await?);
     }
 
     if !args.quiet {
@@ -296,6 +352,58 @@ struct Tally {
     restamped: u64,
 }
 
+async fn start_recorder(args: &Args, sink: &Sink, prefix: &str) -> Result<Recorder> {
+    let path = args
+        .record_to
+        .as_ref()
+        .context("--record needs --record-to PATH to say where the mcap goes")?;
+    Recorder::start(
+        sink,
+        prefix,
+        path,
+        Selection::new(&args.record, &args.record_all_but)?,
+        args.record_compression,
+        record::codec_overrides(&args.record_codecs)?,
+        args.record_codec_default,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn replay_all(
+    source: &mut Source,
+    streams: &[source::Stream],
+    sink: &Sink,
+    args: &Args,
+    mut lockstep: Option<&mut Lockstep>,
+    mut tf: Option<&mut stamp::TfFilter>,
+    audit: &mut stamp::Audit,
+    recorder: Option<&Recorder>,
+    total: &mut Tally,
+) -> Result<()> {
+    loop {
+        let pass = replay_once(
+            source,
+            streams,
+            sink,
+            args,
+            lockstep.as_deref_mut(),
+            tf.as_deref_mut(),
+            audit,
+            recorder,
+        )
+        .await?;
+        total.published += pass.published;
+        total.skipped += pass.skipped;
+        total.restamped += pass.restamped;
+        if !args.repeat {
+            return Ok(());
+        }
+        source.rewind()?;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn replay_once(
     source: &mut Source,
     streams: &[source::Stream],
@@ -304,6 +412,7 @@ async fn replay_once(
     mut lockstep: Option<&mut Lockstep>,
     mut tf: Option<&mut stamp::TfFilter>,
     audit: &mut stamp::Audit,
+    recorder: Option<&Recorder>,
 ) -> Result<Tally> {
     let mut base: Option<f64> = None;
     let mut anchor: Option<Anchor> = None;
@@ -375,6 +484,9 @@ async fn replay_once(
         audit.inspect(record.stream, stream.support, &data, received_ns);
         if retimer.apply(stream.support, &mut data, received_ns)? {
             tally.restamped += 1;
+        }
+        if let Some(recorder) = recorder {
+            recorder.note_published(sink.channel(record.stream), stream.support, &data);
         }
         sink.publish(record.stream, data).await?;
         tally.published += 1;

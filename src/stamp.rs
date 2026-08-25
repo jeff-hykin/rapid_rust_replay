@@ -532,6 +532,29 @@ fn same_clock(stamp_ns: i64, received_ns: i64) -> bool {
     received_ns == 0 || (stamp_ns - received_ns).abs() < SAME_CLOCK_NS
 }
 
+/// The payload's own timestamp in nanoseconds, or `None` when the type has no
+/// known stamp field, the payload is too short, or the stamp is unset.
+///
+/// This is what a recorder writes as `publish_time`, and — being derived from
+/// the bytes rather than from arrival — it is also what lets a message this
+/// process published be recognised when it loops back.
+pub fn stamp_of(support: Support, buf: &[u8]) -> Option<i64> {
+    match support {
+        Support::None => None,
+        Support::Fixed(offset) => match buf.len() >= offset + 8 {
+            true => read_nanos(buf, offset),
+            false => None,
+        },
+        // Each transform carries its own stamp; the first stands for the
+        // message, which is all an identity needs.
+        Support::TfMessage => {
+            let message = TFMessage::decode(buf).ok()?;
+            let stamp = &message.transforms.first()?.header.stamp;
+            nanos_from_parts(stamp.sec, stamp.nsec)
+        }
+    }
+}
+
 fn read_nanos(buf: &[u8], offset: usize) -> Option<i64> {
     let sec = i32::from_be_bytes(buf[offset..offset + 4].try_into().ok()?);
     let nsec = i32::from_be_bytes(buf[offset + 4..offset + 8].try_into().ok()?);
