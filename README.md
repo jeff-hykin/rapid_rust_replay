@@ -97,38 +97,40 @@ it will actually publish on, which is the quickest way to check a mapping.
 
 ## Replaying `tf`
 
-A recording carries whatever transforms were on the wire when it was made,
-including the odometry edges published by the graph that recorded it. Replay
-those into a live graph that publishes its own and a frame ends up with two
-parents; TF then resolves it by whichever arrived most recently, which is a
-silent and roughly fixed error in every pose derived from that frame.
+Replay `tf`. Every transform, exactly as recorded — that is the default and it
+is almost always what you want. The recorded tree is what the hardware actually
+reported that day; anything else is a guess. Synthesizing the mount tree from a
+URDF instead scores whatever calibration happens to be committed today, and on
+`drive_2026-08-18_23-05-04.db` that meant handing cuVSLAM a D435's 50 mm stereo
+baseline for a D455 that reports 95 mm. Triangulation scales linearly with
+baseline, so the trajectory came out 1.9x off — 3.21 m RMSE against point-lio
+instead of 0.90 m. Nothing errored. Recorded tf is not optional decoration.
 
-This is not hypothetical. `drive_2026-08-18_23-05-04.db` carries `mid360_link`
-under both `base_link` (the 22.57° lidar mounting) and `odom`.
+The one hazard is a double parent: replay an edge that a live module also
+publishes and TF resolves the frame by whichever arrived most recently, a silent
+and roughly fixed error in every pose derived from it. `drive_2026-08-18_23-05-04.db`
+carries `mid360_link` under both `base_link` and `odom`, so replaying it
+alongside a live point-lio would collide.
 
-So the edges a live graph owns are dropped by default: anything parented on
-`odom`, `map` or `visual_odom`, and anything whose child is `base_link`. Each
-dropped edge is reported by name at the end of the run:
+Fix that at the source, not in the replay. If the live module and the recording
+claim the same edge, move the live one — dim_slam takes its output frame from
+config. If the recording's tf is wrong or incomplete, correct the database.
+
+`--drop-tf PARENT:CHILD` is the escape hatch when neither is possible. It is
+repeatable and `*` matches any frame on either side:
+
+```sh
+rrr recording.db --drop-tf 'odom:mid360_link' --drop-tf 'camera_link:*'
+```
+
+With a rule in play, every dropped edge is reported by name at the end of the
+run, and a message left with no transforms at all is not published:
 
 ```
 published 7190 message(s)
 dropped 594 tf transform(s):
   odom -> mid360_link (594)
 ```
-
-The report prints even when nothing matched (`dropped 0 tf transform(s)`), so a
-clean recording can be told apart from a filter that never ran. Messages left
-with no transforms at all are not published.
-
-`--drop-tf PARENT:CHILD` adds rules, repeatably, and `*` matches any frame on
-either side:
-
-```sh
-rrr recording.db --drop-tf 'camera_link:*'
-```
-
-`--keep-tf` replays `tf` exactly as recorded. That is right for feeding a viewer
-or an otherwise empty graph, and wrong whenever something else is publishing tf.
 
 ## Timestamps
 
@@ -188,8 +190,7 @@ the same factor, landing within 2 ms of their own stamps.
 -t, --transport <lcm|zenoh>   transport to publish on [default: lcm]
 -s, --stream <NAME>           stream to replay, repeatable; trailing * matches a prefix
     --rename <OLD:NEW>        publish a stream under another name, repeatable
-    --drop-tf <PARENT:CHILD>  also drop this tf edge, repeatable; * matches any frame
-    --keep-tf                 replay tf as recorded, live-owned edges included
+    --drop-tf <PARENT:CHILD>  drop this tf edge, repeatable; * matches any frame
 -r, --rate <RATE>             2 is twice realtime, 0.5 half, 0 disables pacing [default: 1]
     --stamps <MODE>           scaled | shifted | original [default: scaled]
     --prefix <PREFIX>         prepended to every name [default: / on lcm, dimos/ on zenoh]

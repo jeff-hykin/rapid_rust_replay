@@ -16,23 +16,16 @@ use lcm_msgs::tf2_msgs::TFMessage;
 /// The LCM type name of a `tf` stream, the only one `TfFilter` applies to.
 pub const TF_MESSAGE: &str = "tf2_msgs.TFMessage";
 
-/// Edges a live graph publishes for itself, so a replay must not also supply
-/// them. Parent or child may be `*`.
-const LIVE_OWNED: [(&str, &str); 4] =
-    [("odom", "*"), ("map", "*"), ("visual_odom", "*"), ("*", "base_link")];
-
-/// Drops the transforms inside a `tf` message that the live graph owns.
+/// Drops named transforms from a replayed `tf` message.
 ///
-/// A recording carries whatever odometry edges were on the wire when it was
-/// made, and the graph replaying into publishes its own. Both reaching TF gives
-/// one frame two parents, which TF resolves by whichever arrived most recently
-/// — a silent, roughly fixed error in every pose derived from it, with nothing
-/// logged anywhere. `drive_2026-08-18_23-05-04.db` carries `mid360_link` under
-/// both `base_link` (the 22.57° lidar mounting) and `odom`, so this is not
-/// hypothetical.
+/// Worth reaching for when the graph being replayed into publishes an edge the
+/// recording also carries: both reaching TF gives one frame two parents, which
+/// TF resolves by whichever arrived most recently — a silent, roughly fixed
+/// error in every pose derived from it. `drive_2026-08-18_23-05-04.db` carries
+/// `mid360_link` under both `base_link` (the 22.57° lidar mounting) and `odom`,
+/// so this is not hypothetical.
 ///
-/// On by default for that reason: replaying `tf` is the obvious thing to try,
-/// and it is the quiet failures that cost whole runs.
+/// Entirely opt-in: with no `--drop-tf` rule a replay reproduces the recording.
 pub struct TfFilter {
     rules: Vec<(String, String)>,
     dropped: BTreeMap<(String, String), u64>,
@@ -41,10 +34,9 @@ pub struct TfFilter {
 }
 
 impl TfFilter {
-    /// `specs` are extra `PARENT:CHILD` rules on top of the built-in set.
+    /// `specs` are `PARENT:CHILD` rules; `*` matches any frame on either side.
     pub fn new(specs: &[String]) -> Result<Self> {
-        let mut rules: Vec<(String, String)> =
-            LIVE_OWNED.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        let mut rules = Vec::with_capacity(specs.len());
         for spec in specs {
             let (parent, child) = spec
                 .split_once(':')
@@ -57,7 +49,7 @@ impl TfFilter {
         Ok(Self { rules, dropped: BTreeMap::new(), emptied: 0 })
     }
 
-    fn owned_by_the_live_graph(&self, parent: &str, child: &str) -> bool {
+    fn matches_a_rule(&self, parent: &str, child: &str) -> bool {
         self.rules.iter().any(|(p, c)| {
             (p == "*" || p == parent) && (c == "*" || c == child)
         })
@@ -70,7 +62,7 @@ impl TfFilter {
         let mut kept = Vec::with_capacity(message.transforms.len());
         for transform in message.transforms {
             let (parent, child) = (&transform.header.frame_id, &transform.child_frame_id);
-            if self.owned_by_the_live_graph(parent, child) {
+            if self.matches_a_rule(parent, child) {
                 *self.dropped.entry((parent.clone(), child.clone())).or_default() += 1;
             } else {
                 kept.push(transform);
@@ -413,7 +405,7 @@ mod tests {
     /// mounting and dropping the odometry is the whole point of the filter.
     #[test]
     fn the_recorded_odometry_edge_goes_and_the_mounting_stays() {
-        let mut filter = TfFilter::new(&[]).unwrap();
+        let mut filter = TfFilter::new(&["odom:mid360_link".into()]).unwrap();
         let kept = filtered(
             &mut filter,
             &[("base_link", "mid360_link"), ("odom", "mid360_link"), ("base_link", "camera_link")],
@@ -429,11 +421,17 @@ mod tests {
         assert!(filter.report().contains("odom -> mid360_link (1)"), "{}", filter.report());
     }
 
+    /// A replay reproduces the recording unless asked otherwise, including the
+    /// odometry edges a live graph might also be publishing.
     #[test]
-    fn every_live_owned_edge_is_dropped_by_default() {
+    fn nothing_is_dropped_without_a_rule() {
         let mut filter = TfFilter::new(&[]).unwrap();
         for edge in [("odom", "x"), ("map", "x"), ("visual_odom", "x"), ("anything", "base_link")] {
-            assert_eq!(filtered(&mut filter, &[edge]), None, "{edge:?} should have been dropped");
+            assert_eq!(
+                filtered(&mut filter, &[edge]),
+                Some(vec![(edge.0.to_string(), edge.1.to_string())]),
+                "{edge:?} should have been replayed"
+            );
         }
     }
 
@@ -441,7 +439,7 @@ mod tests {
     /// caller needs to know rather than publishing an empty TFMessage.
     #[test]
     fn a_message_of_only_dropped_edges_is_not_published() {
-        let mut filter = TfFilter::new(&[]).unwrap();
+        let mut filter = TfFilter::new(&["odom:base_link".into()]).unwrap();
         assert_eq!(filtered(&mut filter, &[("odom", "base_link")]), None);
         assert!(filter.report().contains("had nothing left"), "{}", filter.report());
     }

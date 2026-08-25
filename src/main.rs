@@ -52,16 +52,10 @@ struct Args {
     #[arg(long = "rename", value_name = "OLD:NEW")]
     renames: Vec<String>,
 
-    /// Also drop this edge from replayed `tf`: `PARENT:CHILD`, repeat for
-    /// several, `*` matches any frame. Edges parented on odom, map or
-    /// visual_odom, and any edge onto base_link, are dropped anyway.
+    /// Drop this edge from replayed `tf`: `PARENT:CHILD`, repeat for several,
+    /// `*` matches any frame. Without it every recorded transform is replayed.
     #[arg(long = "drop-tf", value_name = "PARENT:CHILD")]
     drop_tf: Vec<String>,
-
-    /// Replay `tf` exactly as recorded, including the edges a live graph
-    /// publishes for itself. Only safe when nothing else is publishing tf.
-    #[arg(long = "keep-tf", conflicts_with = "drop_tf")]
-    keep_tf: bool,
 
     /// List the streams in the recording and exit.
     #[arg(long)]
@@ -221,7 +215,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let mut tf = match args.keep_tf {
+    let mut tf = match args.drop_tf.is_empty() {
         true => None,
         false => Some(stamp::TfFilter::new(&args.drop_tf)?),
     };
