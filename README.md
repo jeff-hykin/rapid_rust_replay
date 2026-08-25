@@ -71,7 +71,7 @@ A recording stores each stream under the name of the module that produced it,
 which is not always the name the consumer expects. `--rename OLD:NEW` changes
 the name it is published under:
 
-```
+```sh
 rrr recording.db --rename wheel_odometry:source_odometry
 ```
 
@@ -79,7 +79,7 @@ Several streams may share one `NEW`. That is not a conflict — it is how a ster
 pair reaches a consumer that expects both imagers on one topic and tells them
 apart by `frame_id`:
 
-```
+```sh
 rrr recording.db \
   --rename infrared_left:image \
   --rename infrared_right:image \
