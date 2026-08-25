@@ -95,6 +95,41 @@ and the infrared pair into it in one pass. For the same reason `-s/--stream` and
 applied after the rename. `--list` shows the recorded name alongside the channel
 it will actually publish on, which is the quickest way to check a mapping.
 
+## Replaying `tf`
+
+A recording carries whatever transforms were on the wire when it was made,
+including the odometry edges published by the graph that recorded it. Replay
+those into a live graph that publishes its own and a frame ends up with two
+parents; TF then resolves it by whichever arrived most recently, which is a
+silent and roughly fixed error in every pose derived from that frame.
+
+This is not hypothetical. `drive_2026-08-18_23-05-04.db` carries `mid360_link`
+under both `base_link` (the 22.57° lidar mounting) and `odom`.
+
+So the edges a live graph owns are dropped by default: anything parented on
+`odom`, `map` or `visual_odom`, and anything whose child is `base_link`. Each
+dropped edge is reported by name at the end of the run:
+
+```
+published 7190 message(s)
+dropped 594 tf transform(s):
+  odom -> mid360_link (594)
+```
+
+The report prints even when nothing matched (`dropped 0 tf transform(s)`), so a
+clean recording can be told apart from a filter that never ran. Messages left
+with no transforms at all are not published.
+
+`--drop-tf PARENT:CHILD` adds rules, repeatably, and `*` matches any frame on
+either side:
+
+```sh
+rrr recording.db --drop-tf 'camera_link:*'
+```
+
+`--keep-tf` replays `tf` exactly as recorded. That is right for feeding a viewer
+or an otherwise empty graph, and wrong whenever something else is publishing tf.
+
 ## Timestamps
 
 `--stamps` decides what happens to the timestamp inside each payload:
@@ -153,6 +188,8 @@ the same factor, landing within 2 ms of their own stamps.
 -t, --transport <lcm|zenoh>   transport to publish on [default: lcm]
 -s, --stream <NAME>           stream to replay, repeatable; trailing * matches a prefix
     --rename <OLD:NEW>        publish a stream under another name, repeatable
+    --drop-tf <PARENT:CHILD>  also drop this tf edge, repeatable; * matches any frame
+    --keep-tf                 replay tf as recorded, live-owned edges included
 -r, --rate <RATE>             2 is twice realtime, 0.5 half, 0 disables pacing [default: 1]
     --stamps <MODE>           scaled | shifted | original [default: scaled]
     --prefix <PREFIX>         prepended to every name [default: / on lcm, dimos/ on zenoh]

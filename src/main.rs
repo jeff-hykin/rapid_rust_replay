@@ -52,6 +52,17 @@ struct Args {
     #[arg(long = "rename", value_name = "OLD:NEW")]
     renames: Vec<String>,
 
+    /// Also drop this edge from replayed `tf`: `PARENT:CHILD`, repeat for
+    /// several, `*` matches any frame. Edges parented on odom, map or
+    /// visual_odom, and any edge onto base_link, are dropped anyway.
+    #[arg(long = "drop-tf", value_name = "PARENT:CHILD")]
+    drop_tf: Vec<String>,
+
+    /// Replay `tf` exactly as recorded, including the edges a live graph
+    /// publishes for itself. Only safe when nothing else is publishing tf.
+    #[arg(long = "keep-tf", conflicts_with = "drop_tf")]
+    keep_tf: bool,
+
     /// List the streams in the recording and exit.
     #[arg(long)]
     list: bool,
@@ -210,9 +221,15 @@ async fn main() -> Result<()> {
         }
     }
 
+    let mut tf = match args.keep_tf {
+        true => None,
+        false => Some(stamp::TfFilter::new(&args.drop_tf)?),
+    };
+
     let mut total = Tally::default();
     loop {
-        let pass = replay_once(&mut source, &streams, &sink, &args, lockstep.as_mut()).await?;
+        let pass =
+            replay_once(&mut source, &streams, &sink, &args, lockstep.as_mut(), tf.as_mut()).await?;
         total.published += pass.published;
         total.skipped += pass.skipped;
         total.restamped += pass.restamped;
@@ -233,6 +250,13 @@ async fn main() -> Result<()> {
                  used the recorded arrival time instead",
                 total.restamped
             );
+        }
+        // Reported whenever tf was replayed at all, zero included: silence
+        // cannot be told apart from a filter that never ran.
+        if let Some(tf) = &tf {
+            if streams.iter().any(|stream| stream.msg_name == stamp::TF_MESSAGE) {
+                eprint!("{}", tf.report());
+            }
         }
         if let Some(lockstep) = &lockstep {
             if lockstep.timeouts > 0 {
@@ -271,6 +295,7 @@ async fn replay_once(
     sink: &Sink,
     args: &Args,
     mut lockstep: Option<&mut Lockstep>,
+    mut tf: Option<&mut stamp::TfFilter>,
 ) -> Result<Tally> {
     let mut base: Option<f64> = None;
     let mut anchor: Option<Anchor> = None;
@@ -331,6 +356,13 @@ async fn replay_once(
         }
 
         let mut data = source::to_wire(stream, record.data)?;
+        if stream.msg_name == stamp::TF_MESSAGE {
+            if let Some(tf) = tf.as_deref_mut() {
+                if !tf.apply(&mut data)? {
+                    continue;
+                }
+            }
+        }
         if retimer.apply(stream.support, &mut data, stamp::seconds_to_nanos(record.ts))? {
             tally.restamped += 1;
         }

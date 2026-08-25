@@ -8,8 +8,106 @@
 //! point cloud. `tests::offsets_match_encoder` pins every entry against the
 //! real encoder in `lcm-msgs`.
 
-use anyhow::{Context, Result};
+use std::collections::BTreeMap;
+
+use anyhow::{bail, Context, Result};
 use lcm_msgs::tf2_msgs::TFMessage;
+
+/// The LCM type name of a `tf` stream, the only one `TfFilter` applies to.
+pub const TF_MESSAGE: &str = "tf2_msgs.TFMessage";
+
+/// Edges a live graph publishes for itself, so a replay must not also supply
+/// them. Parent or child may be `*`.
+const LIVE_OWNED: [(&str, &str); 4] =
+    [("odom", "*"), ("map", "*"), ("visual_odom", "*"), ("*", "base_link")];
+
+/// Drops the transforms inside a `tf` message that the live graph owns.
+///
+/// A recording carries whatever odometry edges were on the wire when it was
+/// made, and the graph replaying into publishes its own. Both reaching TF gives
+/// one frame two parents, which TF resolves by whichever arrived most recently
+/// — a silent, roughly fixed error in every pose derived from it, with nothing
+/// logged anywhere. `drive_2026-08-18_23-05-04.db` carries `mid360_link` under
+/// both `base_link` (the 22.57° lidar mounting) and `odom`, so this is not
+/// hypothetical.
+///
+/// On by default for that reason: replaying `tf` is the obvious thing to try,
+/// and it is the quiet failures that cost whole runs.
+pub struct TfFilter {
+    rules: Vec<(String, String)>,
+    dropped: BTreeMap<(String, String), u64>,
+    /// Messages every transform was dropped from, which are not worth sending.
+    emptied: u64,
+}
+
+impl TfFilter {
+    /// `specs` are extra `PARENT:CHILD` rules on top of the built-in set.
+    pub fn new(specs: &[String]) -> Result<Self> {
+        let mut rules: Vec<(String, String)> =
+            LIVE_OWNED.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        for spec in specs {
+            let (parent, child) = spec
+                .split_once(':')
+                .with_context(|| format!("--drop-tf wants PARENT:CHILD, not {spec}"))?;
+            if parent.is_empty() || child.is_empty() {
+                bail!("--drop-tf {spec} has an empty frame; use * to match any");
+            }
+            rules.push((parent.to_string(), child.to_string()));
+        }
+        Ok(Self { rules, dropped: BTreeMap::new(), emptied: 0 })
+    }
+
+    fn owned_by_the_live_graph(&self, parent: &str, child: &str) -> bool {
+        self.rules.iter().any(|(p, c)| {
+            (p == "*" || p == parent) && (c == "*" || c == child)
+        })
+    }
+
+    /// Rewrites `buf` without the dropped transforms. `false` means nothing
+    /// survived and the message should not be published at all.
+    pub fn apply(&mut self, buf: &mut Vec<u8>) -> Result<bool> {
+        let message = TFMessage::decode(buf).context("invalid LCM TFMessage")?;
+        let mut kept = Vec::with_capacity(message.transforms.len());
+        for transform in message.transforms {
+            let (parent, child) = (&transform.header.frame_id, &transform.child_frame_id);
+            if self.owned_by_the_live_graph(parent, child) {
+                *self.dropped.entry((parent.clone(), child.clone())).or_default() += 1;
+            } else {
+                kept.push(transform);
+            }
+        }
+        if kept.is_empty() {
+            self.emptied += 1;
+            return Ok(false);
+        }
+        *buf = TFMessage { transforms: kept }.encode();
+        Ok(true)
+    }
+
+    /// Named per edge rather than totalled, because the count alone does not say
+    /// *which* frame was doubled — the fact that costs a decode pass to recover.
+    /// Printed even when nothing matched, so the reader can tell an empty result
+    /// from a filter that never ran.
+    pub fn report(&self) -> String {
+        let total: u64 = self.dropped.values().sum();
+        let mut report = format!("dropped {total} tf transform(s)");
+        if self.dropped.is_empty() {
+            report.push('\n');
+            return report;
+        }
+        report.push_str(":\n");
+        for ((parent, child), count) in &self.dropped {
+            report.push_str(&format!("  {parent} -> {child} ({count})\n"));
+        }
+        if self.emptied > 0 {
+            report.push_str(&format!(
+                "  {} tf message(s) had nothing left and were not published\n",
+                self.emptied
+            ));
+        }
+        report
+    }
+}
 
 /// How a message type's timestamp can be rewritten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +390,85 @@ mod tests {
             assert_eq!(transform.header.stamp.sec, SEC + 60);
         }
         assert_eq!(decoded.transforms[1].child_frame_id, "camera");
+    }
+
+    fn filtered(filter: &mut TfFilter, edges: &[(&str, &str)]) -> Option<Vec<(String, String)>> {
+        let transforms = edges.iter().map(|(p, c)| geometry_stamped(p, c)).collect();
+        let mut buf = TFMessage { transforms }.encode();
+        if !filter.apply(&mut buf).unwrap() {
+            return None;
+        }
+        Some(
+            TFMessage::decode(&buf)
+                .unwrap()
+                .transforms
+                .iter()
+                .map(|t| (t.header.frame_id.clone(), t.child_frame_id.clone()))
+                .collect(),
+        )
+    }
+
+    /// The real tree in `drive_2026-08-18_23-05-04.db`: `mid360_link` sits under
+    /// both the lidar mounting and the record-time odometry edge. Keeping the
+    /// mounting and dropping the odometry is the whole point of the filter.
+    #[test]
+    fn the_recorded_odometry_edge_goes_and_the_mounting_stays() {
+        let mut filter = TfFilter::new(&[]).unwrap();
+        let kept = filtered(
+            &mut filter,
+            &[("base_link", "mid360_link"), ("odom", "mid360_link"), ("base_link", "camera_link")],
+        )
+        .unwrap();
+        assert_eq!(
+            kept,
+            [
+                ("base_link".to_string(), "mid360_link".to_string()),
+                ("base_link".to_string(), "camera_link".to_string())
+            ]
+        );
+        assert!(filter.report().contains("odom -> mid360_link (1)"), "{}", filter.report());
+    }
+
+    #[test]
+    fn every_live_owned_edge_is_dropped_by_default() {
+        let mut filter = TfFilter::new(&[]).unwrap();
+        for edge in [("odom", "x"), ("map", "x"), ("visual_odom", "x"), ("anything", "base_link")] {
+            assert_eq!(filtered(&mut filter, &[edge]), None, "{edge:?} should have been dropped");
+        }
+    }
+
+    /// A message with nothing left is not worth putting on the wire, and the
+    /// caller needs to know rather than publishing an empty TFMessage.
+    #[test]
+    fn a_message_of_only_dropped_edges_is_not_published() {
+        let mut filter = TfFilter::new(&[]).unwrap();
+        assert_eq!(filtered(&mut filter, &[("odom", "base_link")]), None);
+        assert!(filter.report().contains("had nothing left"), "{}", filter.report());
+    }
+
+    #[test]
+    fn an_extra_rule_may_wildcard_either_side() {
+        let mut filter = TfFilter::new(&["*:mid360_link".into()]).unwrap();
+        assert_eq!(filtered(&mut filter, &[("base_link", "mid360_link")]), None);
+
+        let mut filter = TfFilter::new(&["camera_link:*".into()]).unwrap();
+        assert_eq!(filtered(&mut filter, &[("camera_link", "camera_depth_frame")]), None);
+    }
+
+    /// Zero has to print, or an empty result reads the same as a filter that
+    /// never ran — which is how the missing-prefix bug stayed hidden.
+    #[test]
+    fn a_clean_recording_still_reports_the_filter_ran() {
+        let mut filter = TfFilter::new(&[]).unwrap();
+        assert!(filtered(&mut filter, &[("base_link", "camera_link")]).is_some());
+        assert_eq!(filter.report(), "dropped 0 tf transform(s)\n");
+    }
+
+    #[test]
+    fn a_drop_tf_rule_without_a_colon_is_an_error() {
+        assert!(TfFilter::new(&["odom".into()]).is_err());
+        assert!(TfFilter::new(&["odom:".into()]).is_err());
+        assert!(TfFilter::new(&[":base_link".into()]).is_err());
     }
 
     fn geometry_stamped(frame: &str, child: &str) -> lcm_msgs::geometry_msgs::TransformStamped {
