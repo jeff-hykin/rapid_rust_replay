@@ -8,7 +8,8 @@
 //! point cloud. `tests::offsets_match_encoder` pins every entry against the
 //! real encoder in `lcm-msgs`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use lcm_msgs::tf2_msgs::TFMessage;
@@ -18,12 +19,12 @@ pub const TF_MESSAGE: &str = "tf2_msgs.TFMessage";
 
 /// Drops named transforms from a replayed `tf` message.
 ///
-/// Worth reaching for when the graph being replayed into publishes an edge the
-/// recording also carries: both reaching TF gives one frame two parents, which
-/// TF resolves by whichever arrived most recently — a silent, roughly fixed
-/// error in every pose derived from it. `drive_2026-08-18_23-05-04.db` carries
-/// `mid360_link` under both `base_link` (the 22.57° lidar mounting) and `odom`,
-/// so this is not hypothetical.
+/// Worth reaching for when the graph being replayed into publishes an edge that
+/// lands on a frame the recording also parents: both reaching TF gives one frame
+/// two parents, which TF resolves by whichever arrived most recently — a silent,
+/// roughly fixed error in every pose derived from it. Every Alfred recording
+/// parents `mid360_link` straight off `odom`, so replaying its `tf` into a graph
+/// that publishes the lidar mounting off `base_link` does exactly that.
 ///
 /// Entirely opt-in: with no `--drop-tf` rule a replay reproduces the recording.
 pub struct TfFilter {
@@ -97,6 +98,293 @@ impl TfFilter {
                 self.emptied
             ));
         }
+        report
+    }
+}
+
+/// How long a defect stays quiet after being warned about.
+///
+/// Every defect these checks look for is a property of a stream or of a frame
+/// tree, so once one message trips it every later message trips it too — the
+/// lidar in `drive_2026-08-16_23-46-03.db` would print 107 lines. Each warning
+/// fires on first sight and then at most once a window, carrying the count it
+/// swallowed in between.
+const WARN_EVERY: Duration = Duration::from_secs(5);
+
+struct Throttle {
+    last: Option<Instant>,
+    suppressed: u64,
+}
+
+impl Throttle {
+    fn new() -> Self {
+        Self { last: None, suppressed: 0 }
+    }
+
+    /// `Some(n)` means print now, having swallowed `n` since the previous print.
+    fn ready(&mut self) -> Option<u64> {
+        if self.last.is_some_and(|last| last.elapsed() < WARN_EVERY) {
+            self.suppressed += 1;
+            return None;
+        }
+        self.last = Some(Instant::now());
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+fn and_more(suppressed: u64) -> String {
+    match suppressed {
+        0 => String::new(),
+        n => format!(" ({n} more since the last warning)"),
+    }
+}
+
+fn secs(ns: i64) -> String {
+    format!("{:.3}s", ns as f64 / NANOS_PER_SEC as f64)
+}
+
+fn listed<'a>(frames: impl IntoIterator<Item = &'a str>) -> String {
+    frames.into_iter().collect::<Vec<_>>().join(", ")
+}
+
+/// A payload stamp this far past the recorder's delivery time is two clocks
+/// disagreeing rather than one being wrong: under a single period of a 100 Hz
+/// sensor, "before" and "after" are not meaningfully different. The `lidar`
+/// stream runs up to 2.27s ahead, which is not disagreement.
+const AHEAD_TOLERANCE_NS: i64 = 10 * (NANOS_PER_SEC / 1000);
+
+#[derive(Default)]
+struct StreamStamps {
+    name: String,
+    previous_ns: Option<i64>,
+    ahead: u64,
+    worst_ahead_ns: i64,
+    backwards: u64,
+    worst_backstep_ns: i64,
+}
+
+/// Says out loud what a recording claims that cannot be true.
+///
+/// Nothing here is repaired: a replay puts out what the recording holds. But
+/// each of these changes what a downstream node's own timing and pose come out
+/// to, and all three are invisible from the subscriber's side — which is why
+/// they cost whole debugging sessions before anyone thinks to decode the file.
+///
+/// - A payload stamped *after* the recorder took delivery describes a message
+///   that had not been sent yet.
+/// - A payload stamp walking backwards while arrivals walk forwards is a clock
+///   that is not monotonic. Detected by order, not by magnitude: the bad stamps
+///   have no characteristic offset to threshold against, and a real capture
+///   latency of −0.247s is the same size as some of them.
+/// - A `tf` stream that is not one tree. TF resolves a pose by walking a frame
+///   to its root, so a frame with two parents resolves to whichever edge landed
+///   most recently, and two roots means whole sets of frames cannot be related
+///   at all. Every Alfred recording is two trees: the RealSense hangs off
+///   `base_link` while `mid360_link` hangs off `odom`, with nothing joining
+///   them, so nothing in the file says where the lidar is on the robot.
+///
+/// tf is looked at *after* `--drop-tf`, since dropping the offending edge is
+/// the fix and a warning about an edge that is no longer published is noise.
+/// Single-header types get the stamp checks and tf gets the tree check: a
+/// `TFMessage` is a bag of transforms stamped independently by whoever
+/// published each edge, so it has no one stamp to run backwards.
+pub struct Audit {
+    streams: Vec<StreamStamps>,
+    ahead: Throttle,
+    backwards: Throttle,
+    /// Every parent each frame has been seen under.
+    parents: BTreeMap<String, BTreeSet<String>>,
+    doubled: Throttle,
+    split: Throttle,
+    /// When the frames last stopped forming one tree. A tree assembles an edge
+    /// at a time, so a frame is briefly its own root until its parent's first
+    /// message arrives; only a split that outlives a warning window is real.
+    split_since: Option<Instant>,
+}
+
+impl Audit {
+    pub fn new(stream_names: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            streams: stream_names
+                .into_iter()
+                .map(|name| StreamStamps { name, ..Default::default() })
+                .collect(),
+            ahead: Throttle::new(),
+            backwards: Throttle::new(),
+            parents: BTreeMap::new(),
+            doubled: Throttle::new(),
+            split: Throttle::new(),
+            split_since: None,
+        }
+    }
+
+    /// `buf` is the wire payload as it will be published, before retiming;
+    /// `received_ns` is when the recorder took delivery of it.
+    pub fn inspect(&mut self, stream: usize, support: Support, buf: &[u8], received_ns: i64) {
+        match support {
+            Support::Fixed(offset) => self.check_stamp(stream, offset, buf, received_ns),
+            Support::TfMessage => self.check_tree(buf),
+            Support::None => {}
+        }
+    }
+
+    fn check_stamp(&mut self, stream: usize, offset: usize, buf: &[u8], received_ns: i64) {
+        if received_ns == 0 || buf.len() < offset + 8 {
+            return;
+        }
+        let Some(stamp_ns) = read_nanos(buf, offset) else {
+            return;
+        };
+        // A stamp from another clock entirely is already counted and replaced by
+        // the retimer; measuring an uptime clock against the epoch says nothing.
+        if !same_clock(stamp_ns, received_ns) {
+            return;
+        }
+
+        let stamps = &mut self.streams[stream];
+        let name = stamps.name.clone();
+
+        let ahead_ns = stamp_ns - received_ns;
+        if ahead_ns > AHEAD_TOLERANCE_NS {
+            stamps.ahead += 1;
+            stamps.worst_ahead_ns = stamps.worst_ahead_ns.max(ahead_ns);
+        }
+        let mut backstep_ns = 0;
+        if let Some(previous_ns) = stamps.previous_ns.replace(stamp_ns) {
+            if stamp_ns < previous_ns {
+                backstep_ns = previous_ns - stamp_ns;
+                stamps.backwards += 1;
+                stamps.worst_backstep_ns = stamps.worst_backstep_ns.max(backstep_ns);
+            }
+        }
+
+        if ahead_ns > AHEAD_TOLERANCE_NS {
+            if let Some(suppressed) = self.ahead.ready() {
+                eprintln!(
+                    "warning: {name} is stamped {} after the recorder received it{}",
+                    secs(ahead_ns),
+                    and_more(suppressed)
+                );
+            }
+        }
+        if backstep_ns > 0 {
+            if let Some(suppressed) = self.backwards.ready() {
+                eprintln!(
+                    "warning: {name} stamps went back {} while its arrivals moved forward{}",
+                    secs(backstep_ns),
+                    and_more(suppressed)
+                );
+            }
+        }
+    }
+
+    fn check_tree(&mut self, buf: &[u8]) {
+        // A payload the decoder rejects is the retimer's error to raise.
+        let Ok(message) = TFMessage::decode(buf) else {
+            return;
+        };
+        for transform in &message.transforms {
+            let child = &transform.child_frame_id;
+            let parents = self.parents.entry(child.clone()).or_default();
+            let doubled = parents.insert(transform.header.frame_id.clone()) && parents.len() > 1;
+            let named = match doubled {
+                true => listed(parents.iter().map(String::as_str)),
+                false => String::new(),
+            };
+            if doubled {
+                if let Some(suppressed) = self.doubled.ready() {
+                    eprintln!(
+                        "warning: tf gives {child} more than one parent ({named}){}",
+                        and_more(suppressed)
+                    );
+                }
+            }
+        }
+
+        let roots = self.roots();
+        if roots.len() < 2 {
+            self.split_since = None;
+            return;
+        }
+        let named = listed(roots.iter().copied());
+        let count = roots.len();
+        if self.split_since.get_or_insert_with(Instant::now).elapsed() < WARN_EVERY {
+            return;
+        }
+        if let Some(suppressed) = self.split.ready() {
+            eprintln!(
+                "warning: tf holds {count} separate trees, rooted at {named}{}",
+                and_more(suppressed)
+            );
+        }
+    }
+
+    /// Frames that have been seen as a parent but never as a child. One tree
+    /// has exactly one.
+    fn roots(&self) -> BTreeSet<&str> {
+        self.parents
+            .values()
+            .flatten()
+            .map(String::as_str)
+            .filter(|frame| !self.parents.contains_key(*frame))
+            .collect()
+    }
+
+    /// Named per stream and per frame, because the total says nothing about
+    /// which sensor's clock to distrust or which frame got doubled — and that
+    /// is the fact a decode pass would otherwise be needed to recover.
+    pub fn report(&self) -> String {
+        let mut report = String::new();
+
+        let mut stamps = String::new();
+        for stream in &self.streams {
+            let mut faults = Vec::new();
+            if stream.ahead > 0 {
+                faults.push(format!(
+                    "{} stamp(s) up to {} after arrival",
+                    stream.ahead,
+                    secs(stream.worst_ahead_ns)
+                ));
+            }
+            if stream.backwards > 0 {
+                faults.push(format!(
+                    "{} backwards step(s) up to {}",
+                    stream.backwards,
+                    secs(stream.worst_backstep_ns)
+                ));
+            }
+            if !faults.is_empty() {
+                stamps.push_str(&format!("  {}: {}\n", stream.name, faults.join(", ")));
+            }
+        }
+        if !stamps.is_empty() {
+            report.push_str("stamps that cannot be right:\n");
+            report.push_str(&stamps);
+        }
+
+        let mut tree = String::new();
+        for (child, parents) in &self.parents {
+            if parents.len() > 1 {
+                tree.push_str(&format!(
+                    "  {child} has {} parents: {}\n",
+                    parents.len(),
+                    listed(parents.iter().map(String::as_str))
+                ));
+            }
+        }
+        let roots = self.roots();
+        if roots.len() > 1 {
+            tree.push_str(&format!(
+                "  {} separate trees, rooted at {}\n",
+                roots.len(),
+                listed(roots.iter().copied())
+            ));
+        }
+        if !tree.is_empty() {
+            report.push_str("tf does not describe one tree:\n");
+            report.push_str(&tree);
+        }
+
         report
     }
 }
@@ -479,6 +767,136 @@ mod tests {
             child_frame_id: child.into(),
             ..Default::default()
         }
+    }
+
+    fn audit() -> Audit {
+        Audit::new(["lidar".to_string()])
+    }
+
+    /// Feeds one `sensor_msgs.Image` stamped `stamp_sec` and received at
+    /// `received_sec`, which is the pair the checks compare.
+    fn observe(audit: &mut Audit, stamp_ns: i64, received_ns: i64) {
+        let (sec, nsec) = nanos_to_parts(stamp_ns);
+        let stamped = Header { stamp: Time { sec, nsec }, ..header() };
+        let buf = lcm_msgs::sensor_msgs::Image { header: stamped, ..Default::default() }.encode();
+        audit.inspect(0, support_for("sensor_msgs.Image"), &buf, received_ns);
+    }
+
+    fn at(sec: i64) -> i64 {
+        (i64::from(SEC) + sec) * NANOS_PER_SEC
+    }
+
+    /// A message cannot have been stamped after the recorder took delivery of it.
+    #[test]
+    fn a_stamp_from_after_its_own_arrival_is_reported() {
+        let mut audit = audit();
+        observe(&mut audit, at(0) + 2 * NANOS_PER_SEC, at(0));
+        assert!(
+            audit.report().contains("lidar: 1 stamp(s) up to 2.000s after arrival"),
+            "{}",
+            audit.report()
+        );
+    }
+
+    /// Two clocks a few milliseconds apart are not a broken clock, and warning
+    /// about them every message would bury the ones that are.
+    #[test]
+    fn a_stamp_a_few_milliseconds_early_is_left_alone() {
+        let mut audit = audit();
+        observe(&mut audit, at(0) + NANOS_PER_SEC / 1000, at(0));
+        assert_eq!(audit.report(), "");
+    }
+
+    /// Detected by order rather than magnitude: the bad stamps in
+    /// `drive_2026-08-16_23-46-03.db` scatter from a few ms to 68s behind, and
+    /// a real capture latency is the same size as the small ones.
+    #[test]
+    fn a_stamp_that_walks_backwards_is_reported() {
+        let mut audit = audit();
+        observe(&mut audit, at(10), at(10));
+        observe(&mut audit, at(11), at(11));
+        observe(&mut audit, at(9), at(12));
+        assert!(
+            audit.report().contains("lidar: 1 backwards step(s) up to 2.000s"),
+            "{}",
+            audit.report()
+        );
+    }
+
+    #[test]
+    fn stamps_that_only_move_forward_are_left_alone() {
+        let mut audit = audit();
+        for step in 0..5 {
+            observe(&mut audit, at(step), at(step));
+        }
+        assert_eq!(audit.report(), "");
+    }
+
+    /// An uptime stamp is already counted and replaced by the retimer; measuring
+    /// it against the epoch would report the same defect a second time as an
+    /// implausible 56-year backwards step.
+    #[test]
+    fn a_stamp_from_another_clock_is_not_reported_twice() {
+        let mut audit = audit();
+        observe(&mut audit, at(0), at(0));
+        observe(&mut audit, 1278 * NANOS_PER_SEC, at(1));
+        observe(&mut audit, at(2), at(2));
+        assert_eq!(audit.report(), "");
+    }
+
+    fn observe_tf(audit: &mut Audit, edges: &[(&str, &str)]) {
+        let transforms = edges.iter().map(|(p, c)| geometry_stamped(p, c)).collect();
+        let buf = TFMessage { transforms }.encode();
+        audit.inspect(0, Support::TfMessage, &buf, at(0));
+    }
+
+    /// What replaying an Alfred `tf` stream into a live graph produces:
+    /// the recording's `odom -> mid360_link` meets the graph's own mounting
+    /// edge, and the lidar pose resolves to whichever arrived last.
+    #[test]
+    fn a_frame_with_two_parents_is_reported() {
+        let mut audit = audit();
+        observe_tf(&mut audit, &[("base_link", "mid360_link"), ("base_link", "camera_link")]);
+        observe_tf(&mut audit, &[("odom", "mid360_link")]);
+        assert!(
+            audit.report().contains("mid360_link has 2 parents: base_link, odom"),
+            "{}",
+            audit.report()
+        );
+    }
+
+    /// Frames in two trees cannot be related to each other at all.
+    #[test]
+    fn frames_that_do_not_reach_one_root_are_reported() {
+        let mut audit = audit();
+        observe_tf(&mut audit, &[("base_link", "camera_link"), ("map", "waypoint")]);
+        assert!(
+            audit.report().contains("2 separate trees, rooted at base_link, map"),
+            "{}",
+            audit.report()
+        );
+    }
+
+    /// A tree arrives an edge at a time, so a frame is its own root until its
+    /// parent's first message lands. Nothing may be reported for that.
+    #[test]
+    fn a_tree_assembled_out_of_order_is_not_a_split_tree() {
+        let mut audit = audit();
+        observe_tf(&mut audit, &[("base_link", "camera_link")]);
+        observe_tf(&mut audit, &[("odom", "base_link")]);
+        assert_eq!(audit.report(), "");
+    }
+
+    /// The count that is swallowed has to be carried, or the log understates
+    /// how much of the recording is affected.
+    #[test]
+    fn repeat_warnings_are_throttled_but_still_counted() {
+        let mut audit = audit();
+        for step in 0..100 {
+            observe(&mut audit, at(step) + 2 * NANOS_PER_SEC, at(step));
+        }
+        assert!(audit.report().contains("100 stamp(s) up to 2.000s"), "{}", audit.report());
+        assert!(audit.ahead.suppressed >= 98, "{} suppressed", audit.ahead.suppressed);
     }
 
     /// A driver that stamps with system uptime must not drag the message back

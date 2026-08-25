@@ -220,10 +220,20 @@ async fn main() -> Result<()> {
         false => Some(stamp::TfFilter::new(&args.drop_tf)?),
     };
 
+    let mut audit = stamp::Audit::new(streams.iter().map(|stream| stream.name.clone()));
+
     let mut total = Tally::default();
     loop {
-        let pass =
-            replay_once(&mut source, &streams, &sink, &args, lockstep.as_mut(), tf.as_mut()).await?;
+        let pass = replay_once(
+            &mut source,
+            &streams,
+            &sink,
+            &args,
+            lockstep.as_mut(),
+            tf.as_mut(),
+            &mut audit,
+        )
+        .await?;
         total.published += pass.published;
         total.skipped += pass.skipped;
         total.restamped += pass.restamped;
@@ -258,6 +268,9 @@ async fn main() -> Result<()> {
             }
         }
     }
+    // Outside the quiet block: --quiet is for a replay that went as expected,
+    // and a recording that contradicts itself did not.
+    eprint!("{}", audit.report());
     Ok(())
 }
 
@@ -290,6 +303,7 @@ async fn replay_once(
     args: &Args,
     mut lockstep: Option<&mut Lockstep>,
     mut tf: Option<&mut stamp::TfFilter>,
+    audit: &mut stamp::Audit,
 ) -> Result<Tally> {
     let mut base: Option<f64> = None;
     let mut anchor: Option<Anchor> = None;
@@ -357,7 +371,9 @@ async fn replay_once(
                 }
             }
         }
-        if retimer.apply(stream.support, &mut data, stamp::seconds_to_nanos(record.ts))? {
+        let received_ns = stamp::seconds_to_nanos(record.ts);
+        audit.inspect(record.stream, stream.support, &data, received_ns);
+        if retimer.apply(stream.support, &mut data, received_ns)? {
             tally.restamped += 1;
         }
         sink.publish(record.stream, data).await?;

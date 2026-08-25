@@ -109,8 +109,8 @@ instead of 0.90 m. Nothing errored. Recorded tf is not optional decoration.
 The one hazard is a double parent: replay an edge that a live module also
 publishes and TF resolves the frame by whichever arrived most recently, a silent
 and roughly fixed error in every pose derived from it. `drive_2026-08-18_23-05-04.db`
-carries `mid360_link` under both `base_link` and `odom`, so replaying it
-alongside a live point-lio would collide.
+parents `mid360_link` straight off `odom`, so replaying it alongside a live
+point-lio, which publishes the lidar under `base_link`, would collide.
 
 Fix that at the source, not in the replay. If the live module and the recording
 claim the same edge, move the live one — dim_slam takes its output frame from
@@ -156,6 +156,49 @@ took delivery of the message is treated as coming from another clock, and the
 recorded arrival time is used instead — mapping it as-is would land the message
 before 1970. The count is reported at the end of the run rather than passed
 along silently.
+
+## What the recording gets wrong
+
+Nothing below is repaired — a replay puts out what the recording holds — but all
+of it is invisible from the subscriber's side, which is how it costs people whole
+days. So it is said out loud, per stream and per frame, because a bare total does
+not tell you which sensor to distrust.
+
+- A payload stamped *after* the recorder took delivery of it describes a message
+  that had not been sent yet. Anything under 10 ms is two clocks disagreeing
+  rather than one being wrong, and is ignored.
+- A payload stamp walking backwards while arrivals walk forwards is a clock that
+  is not monotonic. Caught by order rather than magnitude: the bad stamps have no
+  characteristic offset to threshold against, and a real capture latency is the
+  same size as the small ones.
+- A `tf` stream that is not one tree — a frame with two parents, or frames that
+  never reach a common root. This is checked *after* `--drop-tf`, since dropping
+  the offending edge is the fix.
+
+These repeat on every message once they start, so each warning prints on first
+sight and then at most once every five seconds, carrying the count it swallowed:
+
+```
+warning: lidar is stamped 2.273s after the recorder received it
+warning: lidar stamps went back 2.371s while its arrivals moved forward
+warning: tf holds 2 separate trees, rooted at base_link, odom (1781 more since the last warning)
+```
+
+The totals land at the end of the run, and survive `--quiet`:
+
+```
+stamps that cannot be right:
+  lidar: 3 stamp(s) up to 2.273s after arrival, 88 backwards step(s) up to 68.724s
+tf does not describe one tree:
+  2 separate trees, rooted at base_link, odom
+```
+
+That is a real reading of `drive_2026-08-16_23-46-03.db`. The Mid-360 driver
+copies its own arrival into the payload for most messages and produces a garbage
+stamp for the rest; every RealSense stream in the same file is exact. The two
+trees are in every Alfred recording: the camera hangs off `base_link` and the
+lidar off `odom`, with nothing joining them, so nothing in the file says where
+the lidar sits on the robot.
 
 ## Lockstep
 
