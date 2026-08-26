@@ -27,10 +27,18 @@ const LOW_DISK_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 /// How the payload bytes of one stream are stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Codec {
+    /// ROS 2 CDR beside its `ros2msg` schema. The only encoding general tools
+    /// read: Foxglove has no LCM decoder and no message definitions of its own,
+    /// so an LCM channel shows up there as an undecodable blob.
+    Cdr,
     /// Raw LCM wire bytes, exactly as they arrived.
     Lcm,
-    /// LZ4 frame around the wire bytes. Worth it for depth images and point
-    /// clouds, which are mostly repeated bytes.
+    /// LZ4 frame around the wire bytes, and unreadable outside dimos and `rrr`.
+    ///
+    /// Only worth it with `--record-compression none`: measured over 248 Mid-360
+    /// clouds it saves 6.6% against raw LCM uncompressed, but *costs* 6.3% under
+    /// the default zstd chunks, because a compressed payload leaves the chunk
+    /// compressor nothing to find.
     #[value(name = "lz4+lcm")]
     Lz4Lcm,
 }
@@ -38,19 +46,39 @@ pub enum Codec {
 impl Codec {
     fn id(self) -> &'static str {
         match self {
+            Codec::Cdr => "cdr",
             Codec::Lcm => "lcm",
             Codec::Lz4Lcm => "lz4+lcm",
         }
     }
 
-    fn encode(self, wire: Vec<u8>) -> Result<Vec<u8>> {
+    /// What this codec becomes for a stream carrying `msg_name`.
+    ///
+    /// CDR only exists for types with a transcoder, so a stream of anything
+    /// else — a `unitree_go` message, or a stream whose type never turned up —
+    /// is stored as raw LCM rather than dropped.
+    fn resolve(self, msg_name: &str) -> Codec {
         match self {
-            Codec::Lcm => Ok(wire),
+            Codec::Cdr if !crate::cdr::supports(msg_name) => Codec::Lcm,
+            resolved => resolved,
+        }
+    }
+
+    /// Returns the payload, the type it ended up as — only ever different from
+    /// `msg_name` for a jpeg-carrying Image, see `cdr::to_cdr` — and a note when
+    /// the payload had to be written in a shape a viewer cannot render.
+    fn encode(self, msg_name: &str, wire: Vec<u8>) -> Result<(&str, Vec<u8>, Option<String>)> {
+        match self {
+            Codec::Cdr => {
+                let encoded = crate::cdr::to_cdr(msg_name, &wire)?;
+                Ok((encoded.msg_name, encoded.data, encoded.defect))
+            }
+            Codec::Lcm => Ok((msg_name, wire, None)),
             Codec::Lz4Lcm => {
                 use std::io::Write;
                 let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
                 encoder.write_all(&wire)?;
-                encoder.finish().context("lz4 compression failed")
+                Ok((msg_name, encoder.finish().context("lz4 compression failed")?, None))
             }
         }
     }
@@ -191,6 +219,12 @@ pub struct Recorder {
 struct Written {
     messages: u64,
     by_stream: BTreeMap<String, u64>,
+    /// Streams whose payloads would not transcode, with how many were lost and
+    /// why the first one was. Silence here would look like a quiet stream.
+    unencodable: BTreeMap<String, (u64, String)>,
+    /// Streams that were written but in a shape a viewer cannot draw. These are
+    /// in the file and decode fine, so nothing else would ever flag them.
+    unrenderable: BTreeMap<String, (u64, String)>,
 }
 
 impl Recorder {
@@ -220,8 +254,12 @@ impl Recorder {
 
         let file = std::fs::File::create(path)
             .with_context(|| format!("failed to create {}", path.display()))?;
+        // The profile names what a reader should expect to find. Channels are
+        // typed one at a time, so a capture holding one untranscodable stream
+        // is still a ros2 file everywhere it counts.
+        let ros2 = codecs.values().chain([&default_codec]).any(|c| *c == Codec::Cdr);
         let mut writer = mcap::WriteOptions::new()
-            .profile("dimos")
+            .profile(if ros2 { "ros2" } else { "dimos" })
             .compression(compression.to_mcap())
             .create(BufWriter::new(file))?;
 
@@ -230,27 +268,60 @@ impl Recorder {
         // so it gets a thread of its own rather than a slice of the runtime.
         let writing = tokio::task::spawn_blocking(move || {
             let mut written = Written::default();
-            let mut channels: HashMap<String, (u16, Codec, u32)> = HashMap::new();
+            let mut channels: HashMap<String, (u16, String, u32)> = HashMap::new();
             while let Some(message) = receiver.blocking_recv() {
-                let (id, codec, sequence) = match channels.get_mut(&message.stream) {
-                    Some(entry) => entry,
-                    None => {
-                        let codec =
-                            codecs.get(&message.stream).copied().unwrap_or(default_codec);
-                        let id = writer.add_channel(&mcap::Channel {
-                            topic: message.stream.clone(),
-                            schema: None,
-                            message_encoding: codec.id().to_string(),
-                            metadata: channel_metadata(&message.stream, &message.msg_name),
-                        })?;
-                        channels.entry(message.stream.clone()).or_insert((id, codec, 0))
+                let codec = codecs
+                    .get(&message.stream)
+                    .copied()
+                    .unwrap_or(default_codec)
+                    .resolve(&message.msg_name);
+                // Encoding comes first because it is what settles the recorded type:
+                // a jpeg-carrying Image becomes a CompressedImage, and the channel's
+                // schema has to be the one the payloads actually match.
+                //
+                // One malformed payload should cost that message, not the rest of
+                // the capture — the file is only readable once finalised.
+                let (recorded, data, defect) = match codec.encode(&message.msg_name, message.payload)
+                {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        let seen = written
+                            .unencodable
+                            .entry(message.stream)
+                            .or_insert((0, error.to_string()));
+                        seen.0 += 1;
+                        continue;
                     }
                 };
-                let (id, codec, sequence) = (*id, *codec, {
-                    *sequence += 1;
-                    *sequence
-                });
-                let data = codec.encode(message.payload)?;
+                if let Some(why) = defect {
+                    let seen =
+                        written.unrenderable.entry(message.stream.clone()).or_insert((0, why));
+                    seen.0 += 1;
+                }
+                let (id, sequence) = match channels.get_mut(&message.stream) {
+                    Some((id, registered, sequence)) => {
+                        if registered != recorded {
+                            let seen = written.unencodable.entry(message.stream).or_insert((
+                                0,
+                                format!("stream changed type to {recorded} mid-capture"),
+                            ));
+                            seen.0 += 1;
+                            continue;
+                        }
+                        *sequence += 1;
+                        (*id, *sequence)
+                    }
+                    None => {
+                        let id = writer.add_channel(&mcap::Channel {
+                            topic: message.stream.clone(),
+                            schema: schema_for(codec, recorded),
+                            message_encoding: codec.id().to_string(),
+                            metadata: channel_metadata(&message.stream, recorded),
+                        })?;
+                        channels.insert(message.stream.clone(), (id, recorded.to_string(), 1));
+                        (id, 1)
+                    }
+                };
                 writer.write_to_known_channel(
                     &mcap::records::MessageHeader {
                         channel_id: id,
@@ -334,8 +405,31 @@ impl Recorder {
         for (stream, count) in &written.by_stream {
             report.push_str(&format!("  {stream}: {count}\n"));
         }
+        for (stream, (count, why)) in &written.unencodable {
+            report.push_str(&format!("  {stream}: {count} message(s) dropped, {why}\n"));
+        }
+        for (stream, (count, why)) in &written.unrenderable {
+            report.push_str(&format!("  {stream}: {count} message(s) unrenderable, {why}\n"));
+        }
         Ok(report)
     }
+}
+
+/// The ROS message definition a CDR channel is decoded with.
+///
+/// A CDR channel without one is worse than an LCM channel: the bytes are in a
+/// format general tools understand but nothing says what the fields are. LCM
+/// channels carry no schema because there is no schema language for them —
+/// `dimos.payload_type` is what names the type there.
+fn schema_for(codec: Codec, msg_name: &str) -> Option<std::sync::Arc<mcap::Schema<'static>>> {
+    if codec != Codec::Cdr {
+        return None;
+    }
+    Some(std::sync::Arc::new(mcap::Schema {
+        name: crate::schema::schema_name(msg_name)?.to_string(),
+        encoding: "ros2msg".to_string(),
+        data: crate::schema::schema_text(msg_name)?.as_bytes().into(),
+    }))
 }
 
 /// The metadata `McapSource::open` reads back, and that dimos's own MCAP store
@@ -385,9 +479,10 @@ pub fn codec_overrides(specs: &[String]) -> Result<HashMap<String, Codec>> {
             format!("--record-codec wants NAME:CODEC, for example lidar:lz4+lcm, not {spec}")
         })?;
         let codec = match codec {
+            "cdr" => Codec::Cdr,
             "lcm" => Codec::Lcm,
             "lz4+lcm" => Codec::Lz4Lcm,
-            other => bail!("--record-codec {spec}: {other} is not one of lcm, lz4+lcm"),
+            other => bail!("--record-codec {spec}: {other} is not one of cdr, lcm, lz4+lcm"),
         };
         codecs.insert(name.to_string(), codec);
     }
@@ -515,7 +610,7 @@ mod tests {
     #[test]
     fn lz4_codec_output_decodes_back_to_the_wire_bytes() {
         let wire = b"lcm wire bytes, repeated repeated repeated".to_vec();
-        let stored = Codec::Lz4Lcm.encode(wire.clone()).unwrap();
+        let (_, stored, _) = Codec::Lz4Lcm.encode("sensor_msgs.Image", wire.clone()).unwrap();
         assert_ne!(stored, wire);
         let mut decoded = Vec::new();
         std::io::Read::read_to_end(
@@ -524,15 +619,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded, wire);
-        assert_eq!(Codec::Lcm.encode(wire.clone()).unwrap(), wire);
+        assert_eq!(Codec::Lcm.encode("sensor_msgs.Image", wire.clone()).unwrap().1, wire);
     }
 
     #[test]
     fn codec_overrides_are_parsed_per_stream() {
-        let codecs = codec_overrides(&specs(&["lidar:lz4+lcm", "color_image:lcm"])).unwrap();
+        let codecs =
+            codec_overrides(&specs(&["lidar:lz4+lcm", "color_image:lcm", "odom:cdr"])).unwrap();
         assert_eq!(codecs["lidar"], Codec::Lz4Lcm);
         assert_eq!(codecs["color_image"], Codec::Lcm);
+        assert_eq!(codecs["odom"], Codec::Cdr);
         assert!(codec_overrides(&specs(&["lidar:jpeg"])).is_err());
         assert!(codec_overrides(&specs(&["lidar"])).is_err());
+    }
+
+    /// A stream whose type has no transcoder still has to be recorded, just
+    /// without the schema that would let a general tool read it.
+    #[test]
+    fn cdr_falls_back_to_lcm_for_a_type_it_cannot_transcode() {
+        assert_eq!(Codec::Cdr.resolve("sensor_msgs.PointCloud2"), Codec::Cdr);
+        assert_eq!(Codec::Cdr.resolve("unitree_go.LowState"), Codec::Lcm);
+        // A stream whose type never turned up on the wire.
+        assert_eq!(Codec::Cdr.resolve(""), Codec::Lcm);
+        // An explicit choice is never second-guessed.
+        assert_eq!(Codec::Lz4Lcm.resolve("sensor_msgs.PointCloud2"), Codec::Lz4Lcm);
+        assert_eq!(Codec::Lcm.resolve("sensor_msgs.PointCloud2"), Codec::Lcm);
+    }
+
+    /// The whole point of the CDR path: the channel carries a definition
+    /// Foxglove can parse, under the name it matches its renderers on.
+    #[test]
+    fn a_cdr_channel_carries_its_ros_schema() {
+        let schema = schema_for(Codec::Cdr, "sensor_msgs.PointCloud2").expect("a schema");
+        assert_eq!(schema.name, "sensor_msgs/msg/PointCloud2");
+        assert_eq!(schema.encoding, "ros2msg");
+        let text = String::from_utf8(schema.data.to_vec()).unwrap();
+        assert!(text.starts_with("std_msgs/Header header"));
+        assert!(text.contains("MSG: sensor_msgs/PointField"));
+        // ROS 2 spells the stamp as a nested type, not ROS 1's bare `time`.
+        assert!(text.contains("builtin_interfaces/Time stamp"));
+    }
+
+    #[test]
+    fn lcm_channels_carry_no_schema() {
+        assert!(schema_for(Codec::Lcm, "sensor_msgs.PointCloud2").is_none());
+        assert!(schema_for(Codec::Lz4Lcm, "sensor_msgs.PointCloud2").is_none());
+    }
+
+    /// `resolve` runs first, so this can only be reached by asking for CDR on a
+    /// type that has one — but a missing schema must never become a CDR channel
+    /// with nothing to decode it.
+    #[test]
+    fn cdr_without_a_schema_is_not_offered_one() {
+        assert!(schema_for(Codec::Cdr, "unitree_go.LowState").is_none());
     }
 }

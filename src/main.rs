@@ -3,6 +3,7 @@
 mod cdr;
 mod lockstep;
 mod record;
+mod schema;
 mod sink;
 mod source;
 mod stamp;
@@ -115,12 +116,13 @@ struct Args {
     #[arg(long = "record-to", value_name = "PATH")]
     record_to: Option<PathBuf>,
 
-    /// How each stream's payload is stored.
-    #[arg(long = "record-codec-default", value_enum, default_value_t = Codec::Lcm)]
+    /// How each stream's payload is stored. `cdr` is what Foxglove and other
+    /// ROS tools can read; streams with no CDR transcoder fall back to `lcm`.
+    #[arg(long = "record-codec-default", value_enum, default_value_t = Codec::Cdr)]
     record_codec_default: Codec,
 
     /// Override the codec for one stream: `NAME:CODEC`, repeat for several.
-    /// CODEC is `lcm` or `lz4+lcm`.
+    /// CODEC is `cdr`, `lcm` or `lz4+lcm`.
     #[arg(long = "record-codec", value_name = "NAME:CODEC")]
     record_codecs: Vec<String>,
 
